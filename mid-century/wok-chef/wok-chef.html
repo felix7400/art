@@ -1,0 +1,435 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Wok Chef · Mid-Century</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #16171b; }
+  body { display: grid; place-items: center; }
+  canvas { display: block; max-width: 100vw; max-height: 100vh; width: auto; height: auto; }
+</style>
+</head>
+<body>
+<canvas id="art" role="img" aria-label="A cook in a blue jacket and white hat stirs a huge wok on black; flames lick around it, rice flies up in an arc and steam curls."></canvas>
+<script>
+// ===== Parameters =====
+const params = {
+  seed: 7,        // same seed, same picture; a new seed gives a new print
+  scale: 1.08,    // pixels per picture unit: the picture is 1000 x 1250 units, 1.08 gives 1080 x 1350 px
+  animate: true,  // play the seamless loop at 12 drawings per second; false shows the still
+  boil: true,     // let the edges boil like hand-drawn animation
+};
+</script>
+<script>
+// Drawing library of the mid-century style
+// Flat shapes with slightly wobbly edges, brush strokes tapered at both ends, chalk grain.
+// Everything hangs on one seed: same seed, same picture.
+
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+// Catmull-Rom spline through points, sampled in n steps.
+function spline(pts, n) {
+  const out = [];
+  const P = [pts[0], ...pts, pts[pts.length - 1]];
+  const segs = pts.length - 1;
+  for (let s = 0; s <= n; s++) {
+    const tt = (s / n) * segs;
+    let i = Math.min(Math.floor(tt), segs - 1);
+    const t = tt - i;
+    const p0 = P[i], p1 = P[i + 1], p2 = P[i + 2], p3 = P[i + 3];
+    const t2 = t * t, t3 = t2 * t;
+    const f = (a, b, c, d) => 0.5 * (2 * b + (-a + c) * t + (2 * a - 5 * b + 4 * c - d) * t2 + (-a + 3 * b - 3 * c + d) * t3);
+    out.push([f(p0[0], p1[0], p2[0], p3[0]), f(p0[1], p1[1], p2[1], p3[1])]);
+  }
+  return out;
+}
+// Smooth value noise on a 256 grid: drives the wobbly edges and the chalk streaks.
+function valueNoise(seed) {
+  const R = mulberry32(seed), tab = new Float32Array(65536);
+  for (let i = 0; i < tab.length; i++) tab[i] = R();
+  return (x, y) => {
+    const xi = Math.floor(x), yi = Math.floor(y), fx = x - xi, fy = y - yi;
+    const sx = fx * fx * (3 - 2 * fx), sy = fy * fy * (3 - 2 * fy);
+    const x0 = xi & 255, x1 = (xi + 1) & 255, y0 = (yi & 255) << 8, y1 = ((yi + 1) & 255) << 8;
+    const a = tab[x0 + y0], b = tab[x1 + y0], c = tab[x0 + y1], d = tab[x1 + y1];
+    return a + (b - a) * sx + (c - a) * sy + (a - b - c + d) * sx * sy;
+  };
+}
+
+// Splits absolute M/L/Q/C/Z paths into point lists, so edges can wobble like a brush.
+function samplePath(d) {
+  const tok = d.match(/[MLQCZ]|-?\d*\.?\d+/g);
+  const subs = []; let i = 0, cur = [0, 0], start = cur, pts = null;
+  const num = () => parseFloat(tok[i++]);
+  const seg = (a, b) => { const n = Math.max(1, Math.ceil(Math.hypot(b[0] - a[0], b[1] - a[1]) / 6)); for (let k = 1; k <= n; k++) pts.push([a[0] + (b[0] - a[0]) * k / n, a[1] + (b[1] - a[1]) * k / n]); };
+  while (i < tok.length) {
+    const c = tok[i++];
+    if (c === 'M') { cur = [num(), num()]; start = cur; pts = [cur]; subs.push(pts); }
+    else if (c === 'L') { const p = [num(), num()]; seg(cur, p); cur = p; }
+    else if (c === 'Q') {
+      const q = [num(), num()], p = [num(), num()], n = 18;
+      for (let k = 1; k <= n; k++) { const t = k / n, u = 1 - t; pts.push([u * u * cur[0] + 2 * u * t * q[0] + t * t * p[0], u * u * cur[1] + 2 * u * t * q[1] + t * t * p[1]]); }
+      cur = p;
+    } else if (c === 'C') {
+      const c1 = [num(), num()], c2 = [num(), num()], p = [num(), num()], n = 24;
+      for (let k = 1; k <= n; k++) { const t = k / n, u = 1 - t; pts.push([u * u * u * cur[0] + 3 * u * u * t * c1[0] + 3 * u * t * t * c2[0] + t * t * t * p[0], u * u * u * cur[1] + 3 * u * u * t * c1[1] + 3 * u * t * t * c2[1] + t * t * t * p[1]]); }
+      cur = p;
+    } else if (c === 'Z') { seg(cur, start); pts.closed = true; cur = start; }
+  }
+  return subs;
+}
+
+// Drawing tools. Edges wobble along one noise field, so an edge shared by two shapes stays closed.
+// fill: flat shape · line: outline with round ends (closed shapes only) · taper: band along a spline
+// brush: stroke tapered at both ends · at: local coordinates · jit: random offset
+// boil: layer number for boiling lines. Each layer reads the noise field elsewhere, so the edges wobble differently.
+function pen(ctx, vn, rand, boil = 0) {
+  const bo = boil * 37.3;
+  const wob = (subs, amp) => {
+    const p = new Path2D();
+    for (const s of subs) {
+      s.forEach((q, k) => {
+        const x = q[0] + amp * (vn(q[0] / 26 + bo, q[1] / 26 + 50) - 0.5) * 2;
+        const y = q[1] + amp * (vn(q[0] / 26 + 90, q[1] / 26 + bo) - 0.5) * 2;
+        k ? p.lineTo(x, y) : p.moveTo(x, y);
+      });
+      if (s.closed) p.closePath();
+    }
+    return p;
+  };
+  const fill = (d, col, amp = 1.8) => { ctx.fillStyle = col; ctx.fill(wob(samplePath(d), amp)); };
+  const line = (d, col, w, amp = 1.2) => {
+    ctx.strokeStyle = col; ctx.lineWidth = w; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    ctx.stroke(wob(samplePath(d), amp));
+  };
+  const taper = (pts, w0, w1, col, n = 60, cap = true) => {
+    const c = spline(pts, n), L = [], R = [];
+    c.forEach((p, i) => {
+      const a = c[Math.max(0, i - 1)], b = c[Math.min(n, i + 1)];
+      const dx = b[0] - a[0], dy = b[1] - a[1], l = Math.hypot(dx, dy) || 1;
+      const t = i / n, w = (w0 + (w1 - w0) * t) / 2 * (cap ? Math.min(1, Math.sin(Math.min(1, t * 6) * Math.PI / 2) + 0.35) : 1);
+      L.push([p[0] - dy / l * w, p[1] + dx / l * w]); R.push([p[0] + dy / l * w, p[1] - dx / l * w]);
+    });
+    const poly = [...L, ...R.reverse()]; poly.closed = true;
+    ctx.fillStyle = col; ctx.fill(wob([poly], 1.0));
+  };
+  const at = (x, y, rot, fn) => { ctx.save(); ctx.translate(x, y); ctx.rotate(rot); fn(); ctx.restore(); };
+  const jit = (a) => (rand() - 0.5) * 2 * a;
+
+  // One brush stroke: thin, even, tapered at both ends.
+  const brush = (d, col, w, amp = 0.7) => {
+    for (const sp of samplePath(d)) {
+      const n = sp.length;
+      if (n < 2) continue;
+      const cum = [0];
+      for (let i = 1; i < n; i++) cum.push(cum[i - 1] + Math.hypot(sp[i][0] - sp[i - 1][0], sp[i][1] - sp[i - 1][1]));
+      const len = cum[n - 1], tl = Math.min(len * 0.3, 16);
+      const L = [], R = [];
+      for (let i = 0; i < n; i++) {
+        const a = sp[Math.max(0, i - 1)], b = sp[Math.min(n - 1, i + 1)];
+        const dx = b[0] - a[0], dy = b[1] - a[1], l = Math.hypot(dx, dy) || 1;
+        const prof = Math.min(1, (cum[i] + 0.5) / tl, (len - cum[i] + 0.5) / tl);
+        const hw = w / 2 * Math.pow(Math.max(0, prof), 0.5);
+        L.push([sp[i][0] - dy / l * hw, sp[i][1] + dx / l * hw]);
+        R.push([sp[i][0] + dy / l * hw, sp[i][1] - dx / l * hw]);
+      }
+      const poly = [...L, ...R.reverse()]; poly.closed = true;
+      ctx.fillStyle = col; ctx.fill(wob([poly], amp));
+    }
+  };
+  return { fill, line, taper, at, jit, brush };
+}
+
+// Black ground with a few almost invisible blue brush wipes.
+// Works in picture units: on a scaled canvas the wipes keep their place and size.
+function ground(ctx, rand, taper) {
+  const k = ctx.getTransform().a, W = ctx.canvas.width / k, H = ctx.canvas.height / k;
+  ctx.fillStyle = '#07070a'; ctx.fillRect(0, 0, W, H);
+  ctx.globalAlpha = 0.05;
+  for (let k = 0; k < 22; k++) {
+    const x = rand() * W, y = rand() * H, a = -0.6 + rand() * 0.3;
+    taper([[x, y], [x + Math.cos(a) * 140, y + Math.sin(a) * 140], [x + Math.cos(a) * 300, y + Math.sin(a) * 300 + 20]], 30 + rand() * 50, 10, '#5a6aa8', 20, false);
+  }
+  ctx.globalAlpha = 1;
+}
+
+// Chalk: blotches, dry-brush streaks and specks on light areas, faint blue wipes on black.
+// chalkMap computes the grain once per pixel (a factor for light pixels, an offset for dark ones), applyChalk lays it
+// over the finished picture. So in a loop the grain sits still on the paper and does not flicker.
+function chalkMap(W, H, vn, rand) {
+  const lit = new Float32Array(W * H), dark = new Float32Array(W * H);
+  const ca = Math.cos(-0.5), sa = Math.sin(-0.5);
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const i = y * W + x;
+      const u = x * ca - y * sa, v = x * sa + y * ca;
+      const streak = vn(u / 2.2, v / 60);
+      const g = rand();
+      let f = 1 - 0.08 * vn(x / 80 + 300, y / 80) - 0.07 * g;
+      if (streak > 0.66) f -= 0.2 * (streak - 0.66) / 0.34 * vn(x / 30, y / 30 + 200);
+      if (g > 0.985) f -= 0.25;
+      lit[i] = f;
+      dark[i] = (streak > 0.74 ? (streak - 0.74) / 0.26 : 0) * 6 * vn(x / 40 + 500, y / 40) + g * 5;
+    }
+  }
+  return { W, H, lit, dark };
+}
+function applyChalk(ctx, map) {
+  const img = ctx.getImageData(0, 0, map.W, map.H), d = img.data, { lit, dark } = map;
+  for (let i = 0, j = 0; i < lit.length; i++, j += 4) {
+    const L = 0.3 * d[j] + 0.59 * d[j + 1] + 0.11 * d[j + 2];
+    if (L > 40) { const f = lit[i]; d[j] *= f; d[j + 1] *= f; d[j + 2] *= f; }
+    else { const s = dark[i]; d[j] += s * 0.8; d[j + 1] += s * 0.85; d[j + 2] += s * 1.1; }
+  }
+  ctx.putImageData(img, 0, 0);
+}
+function chalk(ctx, vn, rand) { applyChalk(ctx, chalkMap(ctx.canvas.width, ctx.canvas.height, vn, rand)); }
+// Grain with its own seed, computed once per canvas size: for loops in which only some parts move.
+const CHALK_CACHE = new Map();
+function chalkFixed(ctx, seed) {
+  const W = ctx.canvas.width, H = ctx.canvas.height, key = W + 'x' + H + ':' + seed;
+  if (!CHALK_CACHE.has(key)) {
+    if (CHALK_CACHE.size >= 4) CHALK_CACHE.delete(CHALK_CACHE.keys().next().value);
+    CHALK_CACHE.set(key, chalkMap(W, H, valueNoise(seed), mulberry32(seed)));
+  }
+  applyChalk(ctx, CHALK_CACHE.get(key));
+}
+
+// Local frame for hands: origin, rotation (radians), scale, mirrored.
+function frame(x, y, ang, s, mirror) { return new DOMMatrix().translate(x, y).rotate(ang * 180 / Math.PI).scale(mirror ? -s : s, s); }
+function pt(M, x, y) { const p = M.transformPoint({ x, y }); return [p.x, p.y]; }
+
+// A fist around a rod that lies along the local x axis; the wrist is at local -y.
+// Built from flat shapes: cuff, back of the hand, shadow side, four fingers with a lit knuckle and the fingertip
+// in shadow, the thumb across index and middle finger. Black lines only where two skin areas
+// meet: between the fingers, under and over the thumb, at joints, two tendons.
+// skin = { skin, skinDark, skinLit }, the cuff colour in cuff.
+function drawFist(ctx, P, M, skin, ink, cuff) {
+  const { fill, brush } = P;
+  ctx.save(); ctx.transform(M.a, M.b, M.c, M.d, M.e, M.f);
+  fill('M -64 -166 L 68 -166 L 66 -126 L -60 -126 Z', cuff);
+  fill('M -60 -130 L 64 -130 L 86 -50 C 50 -42 -44 -40 -82 -48 Z', skin.skin);
+  fill('M 36 -130 L 64 -130 L 86 -50 L 60 -46 Z', skin.skinDark);
+  brush('M -16 -122 C -20 -100 -28 -78 -36 -58', ink, 2.2);
+  brush('M 14 -124 C 14 -102 12 -80 8 -60', ink, 2.2);
+  const fingers = [[-82, -44, 30], [-44, -6, 32], [-6, 30, 30], [30, 62, 20]];
+  fingers.forEach(([x0, x1, bot], i) => {
+    const m = (x0 + x1) / 2, far = i === 3;
+    fill(`M ${x0} -50 L ${x1} -52 L ${x1} ${bot - 8} Q ${m} ${bot + 14} ${x0} ${bot - 6} Z`, far ? skin.skinDark : skin.skin);
+    fill(`M ${x0 + 4} -48 Q ${m} -64 ${x1 - 4} -50 Q ${m} -40 ${x0 + 4} -48 Z`, far ? skin.skin : skin.skinLit, 0.5);
+    fill(`M ${x0 + 3} ${bot - 6} Q ${m} ${bot + 13} ${x1 - 3} ${bot - 8} Q ${m} ${bot + 2} ${x0 + 3} ${bot - 6} Z`, skin.skinDark, 0.5);
+    if (i < 3) brush(`M ${x1} -46 L ${x1 + 0.5} ${bot - 2}`, ink, 2.4);
+    if (i > 1) brush(`M ${x0 + 10} -8 L ${x1 - 10} -9`, ink, 2.2);
+  });
+  fill('M -62 -116 L -88 -50 L -106 -12 C -114 10 -100 26 -80 24 L -14 18 C 0 16 2 0 -12 -4 L -64 -10 L -58 -60 Z', skin.skinLit);
+  brush('M -62 -10 L -14 -5', ink, 2.4);
+  brush('M -100 23 C -70 27 -36 22 -14 18', ink, 2.6);
+  brush('M -60 -110 C -64 -88 -64 -68 -60 -50', ink, 2.2);
+  ctx.restore();
+}
+
+// The picture, as a still and as a seamless loop.
+// It is drawn in 1000 x 1250 picture units. Options:
+//   opt.t      time in seconds within the loop; 0 is the still
+//   opt.scale  pixels per picture unit (1.08 → 1080 x 1350)
+//   opt.boil   let the edges boil: three layers, each held for two drawings
+// Time runs in drawings of 1/12 s (MC_FPS). Every motion is a whole number of periods per loop,
+// and every frame draws the same number of random values. The grain sits still on the paper (chalkFixed).
+
+const MC_FPS = 12, WOK_LOOP = 4, BOXER_LOOP = 3;
+
+// Prepares the canvas and snaps time to the drawing grid. Returns ctx (in picture units), the phase tau 0..1,
+// the boil layer and osc(f, phase): a sine wave with f whole periods per loop.
+function mcFrame(canvas, W, H, loop, opt) {
+  const S = opt.scale || 1;
+  canvas.width = Math.round(W * S); canvas.height = Math.round(H * S);
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  ctx.setTransform(S, 0, 0, S, 0, 0);
+  const n = Math.floor((opt.t || 0) * MC_FPS + 1e-6), N = Math.round(loop * MC_FPS);
+  const k = ((n % N) + N) % N, tau = k / N;
+  const boil = opt.boil ? Math.floor(k / 2) % 3 : 0;
+  const osc = (f, ph) => Math.sin(2 * Math.PI * (f * tau + ph));
+  return { ctx, tau, k, N, boil, osc };
+}
+const smooth = (x) => { x = Math.max(0, Math.min(1, x)); return x * x * (3 - 2 * x); };
+
+// ---------- The Wok Chef ----------
+function drawWok(canvas, seed, opt = {}) {
+  const W = 1000, H = 1250;
+  const { ctx, tau, boil, osc } = mcFrame(canvas, W, H, WOK_LOOP, opt);
+  const rand = mulberry32(seed * 104729 + 7);
+  const vn = valueNoise(seed * 31 + 5);
+  const C = {
+    bg: '#07070a', ink: '#050506', white: '#f3efe6', blue: '#3a55c2',
+    red: '#d4482a', ochre: '#d8a443', skin: '#6d3820', skinDark: '#4a2414', skinLit: '#94532f', steel: '#17171d', steel2: '#24242d',
+  };
+  const P = pen(ctx, vn, rand, boil), { fill, line, taper, at, jit, brush } = P;
+  const SKIN = { skin: C.skin, skinDark: C.skinDark, skinLit: C.skinLit };
+  const fist = (M) => drawFist(ctx, P, M, SKIN, C.ink, C.white);
+
+  // Stirring: the ladle hand draws small ellipses, four per loop. Ladle and arm follow.
+  const sx = 9 * Math.cos(2 * Math.PI * 4 * tau), sy = 5 * Math.sin(2 * Math.PI * 4 * tau);
+  const FW = frame(908, 938, 0.44, 1.12, false);
+  const FL = frame(374 + sx, 652 + sy, 0.83 + 0.015 * Math.sin(2 * Math.PI * 4 * tau), 0.98, true);
+
+  ground(ctx, rand, taper);
+
+  // --- A burst of flame on the left of the wok. Its three tips lick up and down, each at its own pace.
+  const t1 = jit(30), t2 = jit(30), t3 = jit(24), q1 = rand(), q2 = rand(), q3 = rand();
+  const f1x = 150 + t1 + 14 * osc(3, q1 + 0.25), f1y = 330 + t1 + 38 * osc(3, q1);
+  const f2x = 130 + t2 + 10 * osc(5, q2 + 0.25), f2y = 590 + t2 + 30 * osc(5, q2);
+  const f3x = 290 + t3 + 10 * osc(4, q3 + 0.25), f3y = 530 + t3 + 30 * osc(4, q3);
+  fill(`M -30 1000 L -30 470 C 20 560 44 620 62 690 C 50 580 76 450 ${f1x} ${f1y} C 126 470 146 580 196 660 C 204 600 236 556 ${f3x} ${f3y} C 250 620 250 720 286 800 Z`, C.red);
+  fill(`M -30 980 L -30 680 C 4 720 28 770 40 820 C 50 730 86 650 ${f2x} ${f2y} C 112 690 134 770 176 840 Z`, C.ochre);
+  brush(`M 20 940 C 26 820 60 700 ${118 + (f1x - 150 - t1) * 0.5} ${600 + (f1y - 330 - t1) * 0.4}`, C.white, 3);
+  brush(`M 150 880 C 150 790 186 720 ${236 + (f3x - 290 - t3) * 0.5} ${676 + (f3y - 530 - t3) * 0.4}`, C.white, 3);
+
+  // --- Steam: one big curl and a thread. A wave travels upwards, twice (thread: three times) per loop.
+  const sw = () => jit(20), qd = rand(), qf = rand();
+  const wd = (i, a) => a * osc(2, qd - 0.12 * i), wf = (i, a) => a * osc(3, qf - 0.14 * i);
+  taper([[330, 540], [300 + sw() + wd(1, 8), 440], [350 + sw() + wd(2, 14), 350], [316 + sw() + wd(3, 18), 262],
+    [236 + wd(4, 20), 206 + wd(5, 5)], [176 + wd(5, 20), 222 + wd(6, 6)], [160 + wd(6, 18), 262 + wd(7, 6)]], 52, 6, C.white, 110);
+  taper([[440, 470], [458 + sw() + wf(1, 7), 380], [414 + sw() + wf(2, 11), 300], [452 + sw() + wf(3, 15), 214], [430 + wf(4, 18), 140]], 18, 2, C.white, 60);
+
+  // --- Cook: neck, body, head (small, far away)
+  at(705, 215, -0.22, () => fill('M -30 46 L 34 42 L 40 110 L -34 114 Z', C.skinDark));
+  fill('M 556 336 L 660 296 L 770 292 L 902 330 L 968 450 L 950 720 L 770 870 L 560 790 L 516 520 Z', C.blue);
+  fill('M 516 540 L 566 474 L 600 500 L 590 800 L 556 790 Z', C.ink);
+  brush('M 716 300 C 734 420 760 560 790 870', C.ink, 4);
+  brush('M 650 302 L 668 330 L 752 322 L 772 294', C.white, 3);
+  for (const [x, y] of [[760, 420], [774, 500]]) { ctx.fillStyle = C.white; ctx.beginPath(); ctx.arc(x, y, 9, 0, Math.PI * 2); ctx.fill(); }
+  fill('M 664 300 L 762 292 L 720 368 Z', C.red);
+  brush('M 690 304 L 716 352', C.white, 2.5);
+  at(705, 215, -0.22, () => {
+    fill('M -46 -54 L 44 -60 L 56 -14 L 50 30 L 26 64 L -4 72 L -30 60 L -40 44 L -44 30 L -58 20 L -46 2 L -46 -28 Z', C.skin);
+    fill('M 14 -58 L 44 -60 L 56 -14 L 50 30 L 26 64 L 4 70 L 22 26 L 18 -20 Z', C.skinDark);
+    fill('M -46 -28 L -30 -26 L -34 8 L -46 2 Z', C.skinLit);
+    fill('M 52 -16 L 70 -20 L 72 10 L 54 22 Z', C.skin);
+    brush('M -32 -40 L -4 -44', C.ink, 2.5); brush('M -26 -32 L -8 -34', C.ink, 2.5);
+    brush('M -40 -16 L -24 -12', C.ink, 3.5); brush('M -6 -14 Q 6 -8 20 -14', C.ink, 3.5);
+    fill('M -56 22 Q -34 8 -10 20 Q 8 26 24 18 Q 18 38 -10 36 Q -34 34 -56 22 Z', C.ink);
+    brush('M -34 50 L -12 48', C.ink, 3);
+    fill('M -56 -86 C -84 -120 -66 -190 -20 -196 C 0 -226 54 -220 62 -190 C 96 -170 92 -120 56 -92 Z', C.white);
+    fill('M -50 -50 L 50 -58 L 56 -94 L -54 -86 Z', C.white);
+    brush('M -54 -86 L 56 -94', C.ink, 3);
+    brush('M -24 -90 C -34 -130 -30 -160 -16 -186', C.ink, 2.5);
+    brush('M 18 -94 C 18 -140 24 -170 34 -200', C.ink, 2.5);
+  });
+
+  // --- Ladle arm: a foreshortened wedge from the far shoulder to the huge near hand
+  {
+    const a = pt(FL, -64, -164), b = pt(FL, 68, -164);
+    const [p, q] = a[0] < b[0] ? [a, b] : [b, a];
+    fill(`M 650 378 L 658 382 L ${q[0] + 34} ${q[1] + 16} L ${q[0]} ${q[1]} Z`, C.ink);
+    fill(`M 566 336 L 652 376 L ${q[0]} ${q[1]} L ${p[0]} ${p[1]} Z`, C.blue);
+    brush('M 600 362 C 590 392 578 414 560 432', C.ink, 2.8);
+    brush(`M ${(p[0] * 0.55 + q[0] * 0.45)} ${(p[1] * 0.55 + q[1] * 0.45) - 40} L ${(p[0] * 0.4 + q[0] * 0.6) + 14} ${(p[1] * 0.4 + q[1] * 0.6) - 70}`, C.ink, 2.6);
+  }
+
+  // --- Wok: belly, front flames, rim, rice
+  fill('M -40 900 C -20 1110 160 1270 360 1270 C 560 1270 740 1110 760 880 Z', C.steel);
+  brush('M 10 1010 C 60 1120 160 1190 280 1206', C.white, 3);
+  brush('M 640 1070 C 680 1030 708 990 724 950', C.red, 5);
+  const tongue = (bx, h, w, lean, sway, col) => {
+    const by = 1262;
+    taper([[bx, by], [bx + lean * 0.15 + sway, by - h * 0.35], [bx + lean * 0.5 - sway * 0.6, by - h * 0.68], [bx + lean, by - h]], w, 0, col, 40, false);
+  };
+  // Each tongue flickers 3 to 5 times per loop: height, swing and lean; the inner ochre one is offset.
+  const xs = [-10, 90, 230, 380, 520, 650, 740];
+  xs.forEach((x0, k) => {
+    const x = x0 + jit(26), side = Math.abs(x - 360) / 380;
+    const h = 120 + side * 170 + rand() * 90, w = 110 + rand() * 70, lean = (x - 360) * 0.18 + jit(50);
+    const sway = jit(30), xi = x + jit(10), hi = h * (0.45 + rand() * 0.2), swayi = jit(30);
+    const f = 3 + Math.floor(rand() * 3), q = rand();
+    const hh = h * (1 + 0.13 * osc(f, q) + 0.05 * osc(2 * f + 1, q * 2));
+    tongue(x, hh, w, lean + 16 * osc(f, q + 0.4), sway + 22 * osc(f, q + 0.2), C.red);
+    tongue(xi, hi * (1 + 0.2 * osc(f + 1, q + 0.5)), w * 0.42, lean * 0.6 + 10 * osc(f + 1, q + 0.7), swayi + 14 * osc(f + 1, q + 0.3), C.ochre);
+  });
+  const qa = rand();
+  brush(`M 150 1250 C 160 1200 176 1160 ${196 + 8 * osc(4, qa)} ${1140 - 6 * osc(4, qa + 0.25)}`, C.white, 3);
+  brush(`M 470 1250 C 476 1206 494 1170 ${516 + 8 * osc(3, qa + 0.5)} ${1150 - 6 * osc(3, qa + 0.75)}`, C.white, 3);
+  at(360, 900, -0.12, () => {
+    ctx.fillStyle = C.ink; ctx.beginPath(); ctx.ellipse(0, 0, 400, 170, 0, 0, Math.PI * 2); ctx.fill();
+    fill('M -380 -30 C -300 -150 300 -160 384 -40 C 300 -110 -280 -110 -380 -30 Z', C.steel2);
+    fill('M -260 44 C -250 -20 -120 -50 20 -50 C 160 -48 280 -24 292 26 C 280 86 160 110 20 112 C -120 112 -250 96 -260 44 Z', C.ochre);
+    for (let k = 0; k < 60; k++) {
+      const a = rand() * Math.PI * 2, r = Math.sqrt(rand());
+      const x = 16 + Math.cos(a) * r * 250, y = 30 + Math.sin(a) * r * 66, ang = rand() * 3;
+      brush(`M ${x} ${y} L ${x + Math.cos(ang) * 9} ${y + Math.sin(ang) * 9}`, C.white, 3.5, 0.3);
+    }
+    // Red bits in the rice as triangles, like the flying pieces
+    for (let k = 0; k < 6; k++) {
+      const x = -190 + k * 80 + jit(20), y = 22 + jit(34), s = 0.8 + rand() * 0.5;
+      at(x, y, rand() * 6, () => fill(`M 0 ${-10 * s} L ${10 * s} ${7 * s} L ${-10 * s} ${6 * s} Z`, C.red, 0.5));
+    }
+    ctx.strokeStyle = C.white; ctx.lineWidth = 7; ctx.beginPath(); ctx.ellipse(0, 0, 400, 170, 0, 0, Math.PI * 2); ctx.stroke();
+  });
+
+  // --- Ladle: white handle through the fist, bowl in the rice
+  at(600 + sx, 900 + sy, -0.1, () => {
+    ctx.fillStyle = C.white; ctx.beginPath(); ctx.ellipse(0, 0, 50, 22, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = C.ink; ctx.beginPath(); ctx.ellipse(0, -2, 38, 13, 0, 0, Math.PI * 2); ctx.fill();
+  });
+  taper([[170 + sx, 430 + sy], [390 + sx, 670 + sy], [592 + sx, 890 + sy]], 13, 11, C.white, 20, false);
+  fist(FL);
+
+  // --- Handle arm: shoulder far away, cuff and fist huge in the corner
+  {
+    const a = pt(FW, -64, -164), b = pt(FW, 68, -164);
+    fill(`M 902 330 L 968 450 L 1010 600 L 1012 ${b[1]} L ${b[0]} ${b[1]} L ${a[0]} ${a[1]} L 860 600 Z`, C.blue);
+    brush('M 900 338 L 864 596 L 896 700', C.ink, 3.2);
+    brush('M 930 520 L 986 560', C.ink, 2.8);
+    brush('M 918 640 L 966 690', C.ink, 2.8);
+  }
+  taper([[744, 862], [800, 888], [846, 908]], 26, 28, C.steel, 10, false);
+  brush('M 750 853 L 838 894', C.white, 3);
+  taper([[836, 903], [940, 952], [1060, 1008]], 46, 54, C.ochre, 12, false);
+  brush('M 850 884 L 842 930', C.ink, 3);
+  fist(FW);
+
+  // --- Tossed rice: a loose arc of grains, egg and red bits. Each piece flies up the arc from the wok rim in 2 s,
+  // fast at first and slow at the top, smaller at both ends, turning a whole number of times.
+  for (let k = 0; k < 64; k++) {
+    const u0 = rand(), jx = jit(46), jy = jit(46), r = rand(), ang = rand() * 3, spin = Math.round(jit(2.4));
+    const v = (u0 + 2 * tau) % 1, t = 1 - Math.pow(1 - v, 1.7), u = 1 - t;
+    const size = Math.min(1, v / 0.08, (1 - v) / 0.14);
+    if (size < 0.2) continue;
+    const spread = 0.35 + 0.65 * t;
+    const x = u * u * 170 + 2 * u * t * 30 + t * t * 330 + jx * spread, y = u * u * 760 + 2 * u * t * 320 + t * t * 250 + jy * spread;
+    const a = ang + 2 * Math.PI * spin * tau;
+    at(x, y, a, () => {
+      if (r < 0.62) brush(`M ${-5 * size} 0 L ${5 * size} 0`, C.white, 4 * Math.sqrt(size), 0.3);
+      else if (r < 0.85) fill(`M ${-6 * size} ${-6 * size} L ${8 * size} ${-3 * size} L ${3 * size} ${8 * size} L ${-9 * size} ${4 * size} Z`, C.ochre, 0.8);
+      else fill(`M 0 ${-8 * size} L ${9 * size} ${6 * size} L ${-8 * size} ${5 * size} Z`, C.red, 0.6);
+    });
+  }
+
+  chalkFixed(ctx, seed * 131 + 17);
+}
+
+// ---------- Player ----------
+// Draws only when the time reaches a new drawing (12 per second). Respects reduced motion.
+(function () {
+  const canvas = document.getElementById('art');
+  let last = null;
+  const show = (t) => {
+    const n = Math.floor(t * MC_FPS + 1e-6);
+    if (n === last) return;
+    last = n; drawWok(canvas, params.seed, { t, scale: params.scale, boil: params.boil });
+  };
+  show(0);
+  if (!params.animate || matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+  const start = performance.now();
+  const loop = () => { show(((performance.now() - start) / 1000) % WOK_LOOP); requestAnimationFrame(loop); };
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>

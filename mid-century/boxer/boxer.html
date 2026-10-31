@@ -1,0 +1,416 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Boxer · Mid-Century</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #16171b; }
+  body { display: grid; place-items: center; }
+  canvas { display: block; max-width: 100vw; max-height: 100vh; width: auto; height: auto; }
+</style>
+</head>
+<body>
+<canvas id="art" role="img" aria-label="A boxer throws a punch straight at the viewer, the red glove bigger than the chest; camera flashes pop in the dark crowd and sweat flies."></canvas>
+<script>
+// ===== Parameters =====
+const params = {
+  seed: 7,        // same seed, same picture; a new seed gives a new print
+  scale: 1.08,    // pixels per picture unit: the picture is 1000 x 1250 units, 1.08 gives 1080 x 1350 px
+  animate: true,  // play the seamless loop at 12 drawings per second; false shows the still
+  boil: true,     // let the edges boil like hand-drawn animation
+};
+</script>
+<script>
+// Drawing library of the mid-century style
+// Flat shapes with slightly wobbly edges, brush strokes tapered at both ends, chalk grain.
+// Everything hangs on one seed: same seed, same picture.
+
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+// Catmull-Rom spline through points, sampled in n steps.
+function spline(pts, n) {
+  const out = [];
+  const P = [pts[0], ...pts, pts[pts.length - 1]];
+  const segs = pts.length - 1;
+  for (let s = 0; s <= n; s++) {
+    const tt = (s / n) * segs;
+    let i = Math.min(Math.floor(tt), segs - 1);
+    const t = tt - i;
+    const p0 = P[i], p1 = P[i + 1], p2 = P[i + 2], p3 = P[i + 3];
+    const t2 = t * t, t3 = t2 * t;
+    const f = (a, b, c, d) => 0.5 * (2 * b + (-a + c) * t + (2 * a - 5 * b + 4 * c - d) * t2 + (-a + 3 * b - 3 * c + d) * t3);
+    out.push([f(p0[0], p1[0], p2[0], p3[0]), f(p0[1], p1[1], p2[1], p3[1])]);
+  }
+  return out;
+}
+// Smooth value noise on a 256 grid: drives the wobbly edges and the chalk streaks.
+function valueNoise(seed) {
+  const R = mulberry32(seed), tab = new Float32Array(65536);
+  for (let i = 0; i < tab.length; i++) tab[i] = R();
+  return (x, y) => {
+    const xi = Math.floor(x), yi = Math.floor(y), fx = x - xi, fy = y - yi;
+    const sx = fx * fx * (3 - 2 * fx), sy = fy * fy * (3 - 2 * fy);
+    const x0 = xi & 255, x1 = (xi + 1) & 255, y0 = (yi & 255) << 8, y1 = ((yi + 1) & 255) << 8;
+    const a = tab[x0 + y0], b = tab[x1 + y0], c = tab[x0 + y1], d = tab[x1 + y1];
+    return a + (b - a) * sx + (c - a) * sy + (a - b - c + d) * sx * sy;
+  };
+}
+
+// Splits absolute M/L/Q/C/Z paths into point lists, so edges can wobble like a brush.
+function samplePath(d) {
+  const tok = d.match(/[MLQCZ]|-?\d*\.?\d+/g);
+  const subs = []; let i = 0, cur = [0, 0], start = cur, pts = null;
+  const num = () => parseFloat(tok[i++]);
+  const seg = (a, b) => { const n = Math.max(1, Math.ceil(Math.hypot(b[0] - a[0], b[1] - a[1]) / 6)); for (let k = 1; k <= n; k++) pts.push([a[0] + (b[0] - a[0]) * k / n, a[1] + (b[1] - a[1]) * k / n]); };
+  while (i < tok.length) {
+    const c = tok[i++];
+    if (c === 'M') { cur = [num(), num()]; start = cur; pts = [cur]; subs.push(pts); }
+    else if (c === 'L') { const p = [num(), num()]; seg(cur, p); cur = p; }
+    else if (c === 'Q') {
+      const q = [num(), num()], p = [num(), num()], n = 18;
+      for (let k = 1; k <= n; k++) { const t = k / n, u = 1 - t; pts.push([u * u * cur[0] + 2 * u * t * q[0] + t * t * p[0], u * u * cur[1] + 2 * u * t * q[1] + t * t * p[1]]); }
+      cur = p;
+    } else if (c === 'C') {
+      const c1 = [num(), num()], c2 = [num(), num()], p = [num(), num()], n = 24;
+      for (let k = 1; k <= n; k++) { const t = k / n, u = 1 - t; pts.push([u * u * u * cur[0] + 3 * u * u * t * c1[0] + 3 * u * t * t * c2[0] + t * t * t * p[0], u * u * u * cur[1] + 3 * u * u * t * c1[1] + 3 * u * t * t * c2[1] + t * t * t * p[1]]); }
+      cur = p;
+    } else if (c === 'Z') { seg(cur, start); pts.closed = true; cur = start; }
+  }
+  return subs;
+}
+
+// Drawing tools. Edges wobble along one noise field, so an edge shared by two shapes stays closed.
+// fill: flat shape · line: outline with round ends (closed shapes only) · taper: band along a spline
+// brush: stroke tapered at both ends · at: local coordinates · jit: random offset
+// boil: layer number for boiling lines. Each layer reads the noise field elsewhere, so the edges wobble differently.
+function pen(ctx, vn, rand, boil = 0) {
+  const bo = boil * 37.3;
+  const wob = (subs, amp) => {
+    const p = new Path2D();
+    for (const s of subs) {
+      s.forEach((q, k) => {
+        const x = q[0] + amp * (vn(q[0] / 26 + bo, q[1] / 26 + 50) - 0.5) * 2;
+        const y = q[1] + amp * (vn(q[0] / 26 + 90, q[1] / 26 + bo) - 0.5) * 2;
+        k ? p.lineTo(x, y) : p.moveTo(x, y);
+      });
+      if (s.closed) p.closePath();
+    }
+    return p;
+  };
+  const fill = (d, col, amp = 1.8) => { ctx.fillStyle = col; ctx.fill(wob(samplePath(d), amp)); };
+  const line = (d, col, w, amp = 1.2) => {
+    ctx.strokeStyle = col; ctx.lineWidth = w; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    ctx.stroke(wob(samplePath(d), amp));
+  };
+  const taper = (pts, w0, w1, col, n = 60, cap = true) => {
+    const c = spline(pts, n), L = [], R = [];
+    c.forEach((p, i) => {
+      const a = c[Math.max(0, i - 1)], b = c[Math.min(n, i + 1)];
+      const dx = b[0] - a[0], dy = b[1] - a[1], l = Math.hypot(dx, dy) || 1;
+      const t = i / n, w = (w0 + (w1 - w0) * t) / 2 * (cap ? Math.min(1, Math.sin(Math.min(1, t * 6) * Math.PI / 2) + 0.35) : 1);
+      L.push([p[0] - dy / l * w, p[1] + dx / l * w]); R.push([p[0] + dy / l * w, p[1] - dx / l * w]);
+    });
+    const poly = [...L, ...R.reverse()]; poly.closed = true;
+    ctx.fillStyle = col; ctx.fill(wob([poly], 1.0));
+  };
+  const at = (x, y, rot, fn) => { ctx.save(); ctx.translate(x, y); ctx.rotate(rot); fn(); ctx.restore(); };
+  const jit = (a) => (rand() - 0.5) * 2 * a;
+
+  // One brush stroke: thin, even, tapered at both ends.
+  const brush = (d, col, w, amp = 0.7) => {
+    for (const sp of samplePath(d)) {
+      const n = sp.length;
+      if (n < 2) continue;
+      const cum = [0];
+      for (let i = 1; i < n; i++) cum.push(cum[i - 1] + Math.hypot(sp[i][0] - sp[i - 1][0], sp[i][1] - sp[i - 1][1]));
+      const len = cum[n - 1], tl = Math.min(len * 0.3, 16);
+      const L = [], R = [];
+      for (let i = 0; i < n; i++) {
+        const a = sp[Math.max(0, i - 1)], b = sp[Math.min(n - 1, i + 1)];
+        const dx = b[0] - a[0], dy = b[1] - a[1], l = Math.hypot(dx, dy) || 1;
+        const prof = Math.min(1, (cum[i] + 0.5) / tl, (len - cum[i] + 0.5) / tl);
+        const hw = w / 2 * Math.pow(Math.max(0, prof), 0.5);
+        L.push([sp[i][0] - dy / l * hw, sp[i][1] + dx / l * hw]);
+        R.push([sp[i][0] + dy / l * hw, sp[i][1] - dx / l * hw]);
+      }
+      const poly = [...L, ...R.reverse()]; poly.closed = true;
+      ctx.fillStyle = col; ctx.fill(wob([poly], amp));
+    }
+  };
+  return { fill, line, taper, at, jit, brush };
+}
+
+// Black ground with a few almost invisible blue brush wipes.
+// Works in picture units: on a scaled canvas the wipes keep their place and size.
+function ground(ctx, rand, taper) {
+  const k = ctx.getTransform().a, W = ctx.canvas.width / k, H = ctx.canvas.height / k;
+  ctx.fillStyle = '#07070a'; ctx.fillRect(0, 0, W, H);
+  ctx.globalAlpha = 0.05;
+  for (let k = 0; k < 22; k++) {
+    const x = rand() * W, y = rand() * H, a = -0.6 + rand() * 0.3;
+    taper([[x, y], [x + Math.cos(a) * 140, y + Math.sin(a) * 140], [x + Math.cos(a) * 300, y + Math.sin(a) * 300 + 20]], 30 + rand() * 50, 10, '#5a6aa8', 20, false);
+  }
+  ctx.globalAlpha = 1;
+}
+
+// Chalk: blotches, dry-brush streaks and specks on light areas, faint blue wipes on black.
+// chalkMap computes the grain once per pixel (a factor for light pixels, an offset for dark ones), applyChalk lays it
+// over the finished picture. So in a loop the grain sits still on the paper and does not flicker.
+function chalkMap(W, H, vn, rand) {
+  const lit = new Float32Array(W * H), dark = new Float32Array(W * H);
+  const ca = Math.cos(-0.5), sa = Math.sin(-0.5);
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const i = y * W + x;
+      const u = x * ca - y * sa, v = x * sa + y * ca;
+      const streak = vn(u / 2.2, v / 60);
+      const g = rand();
+      let f = 1 - 0.08 * vn(x / 80 + 300, y / 80) - 0.07 * g;
+      if (streak > 0.66) f -= 0.2 * (streak - 0.66) / 0.34 * vn(x / 30, y / 30 + 200);
+      if (g > 0.985) f -= 0.25;
+      lit[i] = f;
+      dark[i] = (streak > 0.74 ? (streak - 0.74) / 0.26 : 0) * 6 * vn(x / 40 + 500, y / 40) + g * 5;
+    }
+  }
+  return { W, H, lit, dark };
+}
+function applyChalk(ctx, map) {
+  const img = ctx.getImageData(0, 0, map.W, map.H), d = img.data, { lit, dark } = map;
+  for (let i = 0, j = 0; i < lit.length; i++, j += 4) {
+    const L = 0.3 * d[j] + 0.59 * d[j + 1] + 0.11 * d[j + 2];
+    if (L > 40) { const f = lit[i]; d[j] *= f; d[j + 1] *= f; d[j + 2] *= f; }
+    else { const s = dark[i]; d[j] += s * 0.8; d[j + 1] += s * 0.85; d[j + 2] += s * 1.1; }
+  }
+  ctx.putImageData(img, 0, 0);
+}
+function chalk(ctx, vn, rand) { applyChalk(ctx, chalkMap(ctx.canvas.width, ctx.canvas.height, vn, rand)); }
+// Grain with its own seed, computed once per canvas size: for loops in which only some parts move.
+const CHALK_CACHE = new Map();
+function chalkFixed(ctx, seed) {
+  const W = ctx.canvas.width, H = ctx.canvas.height, key = W + 'x' + H + ':' + seed;
+  if (!CHALK_CACHE.has(key)) {
+    if (CHALK_CACHE.size >= 4) CHALK_CACHE.delete(CHALK_CACHE.keys().next().value);
+    CHALK_CACHE.set(key, chalkMap(W, H, valueNoise(seed), mulberry32(seed)));
+  }
+  applyChalk(ctx, CHALK_CACHE.get(key));
+}
+
+// Local frame for hands: origin, rotation (radians), scale, mirrored.
+function frame(x, y, ang, s, mirror) { return new DOMMatrix().translate(x, y).rotate(ang * 180 / Math.PI).scale(mirror ? -s : s, s); }
+function pt(M, x, y) { const p = M.transformPoint({ x, y }); return [p.x, p.y]; }
+
+// A fist around a rod that lies along the local x axis; the wrist is at local -y.
+// Built from flat shapes: cuff, back of the hand, shadow side, four fingers with a lit knuckle and the fingertip
+// in shadow, the thumb across index and middle finger. Black lines only where two skin areas
+// meet: between the fingers, under and over the thumb, at joints, two tendons.
+// skin = { skin, skinDark, skinLit }, the cuff colour in cuff.
+function drawFist(ctx, P, M, skin, ink, cuff) {
+  const { fill, brush } = P;
+  ctx.save(); ctx.transform(M.a, M.b, M.c, M.d, M.e, M.f);
+  fill('M -64 -166 L 68 -166 L 66 -126 L -60 -126 Z', cuff);
+  fill('M -60 -130 L 64 -130 L 86 -50 C 50 -42 -44 -40 -82 -48 Z', skin.skin);
+  fill('M 36 -130 L 64 -130 L 86 -50 L 60 -46 Z', skin.skinDark);
+  brush('M -16 -122 C -20 -100 -28 -78 -36 -58', ink, 2.2);
+  brush('M 14 -124 C 14 -102 12 -80 8 -60', ink, 2.2);
+  const fingers = [[-82, -44, 30], [-44, -6, 32], [-6, 30, 30], [30, 62, 20]];
+  fingers.forEach(([x0, x1, bot], i) => {
+    const m = (x0 + x1) / 2, far = i === 3;
+    fill(`M ${x0} -50 L ${x1} -52 L ${x1} ${bot - 8} Q ${m} ${bot + 14} ${x0} ${bot - 6} Z`, far ? skin.skinDark : skin.skin);
+    fill(`M ${x0 + 4} -48 Q ${m} -64 ${x1 - 4} -50 Q ${m} -40 ${x0 + 4} -48 Z`, far ? skin.skin : skin.skinLit, 0.5);
+    fill(`M ${x0 + 3} ${bot - 6} Q ${m} ${bot + 13} ${x1 - 3} ${bot - 8} Q ${m} ${bot + 2} ${x0 + 3} ${bot - 6} Z`, skin.skinDark, 0.5);
+    if (i < 3) brush(`M ${x1} -46 L ${x1 + 0.5} ${bot - 2}`, ink, 2.4);
+    if (i > 1) brush(`M ${x0 + 10} -8 L ${x1 - 10} -9`, ink, 2.2);
+  });
+  fill('M -62 -116 L -88 -50 L -106 -12 C -114 10 -100 26 -80 24 L -14 18 C 0 16 2 0 -12 -4 L -64 -10 L -58 -60 Z', skin.skinLit);
+  brush('M -62 -10 L -14 -5', ink, 2.4);
+  brush('M -100 23 C -70 27 -36 22 -14 18', ink, 2.6);
+  brush('M -60 -110 C -64 -88 -64 -68 -60 -50', ink, 2.2);
+  ctx.restore();
+}
+
+// The picture, as a still and as a seamless loop.
+// It is drawn in 1000 x 1250 picture units. Options:
+//   opt.t      time in seconds within the loop; 0 is the still
+//   opt.scale  pixels per picture unit (1.08 → 1080 x 1350)
+//   opt.boil   let the edges boil: three layers, each held for two drawings
+// Time runs in drawings of 1/12 s (MC_FPS). Every motion is a whole number of periods per loop,
+// and every frame draws the same number of random values. The grain sits still on the paper (chalkFixed).
+
+const MC_FPS = 12, WOK_LOOP = 4, BOXER_LOOP = 3;
+
+// Prepares the canvas and snaps time to the drawing grid. Returns ctx (in picture units), the phase tau 0..1,
+// the boil layer and osc(f, phase): a sine wave with f whole periods per loop.
+function mcFrame(canvas, W, H, loop, opt) {
+  const S = opt.scale || 1;
+  canvas.width = Math.round(W * S); canvas.height = Math.round(H * S);
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  ctx.setTransform(S, 0, 0, S, 0, 0);
+  const n = Math.floor((opt.t || 0) * MC_FPS + 1e-6), N = Math.round(loop * MC_FPS);
+  const k = ((n % N) + N) % N, tau = k / N;
+  const boil = opt.boil ? Math.floor(k / 2) % 3 : 0;
+  const osc = (f, ph) => Math.sin(2 * Math.PI * (f * tau + ph));
+  return { ctx, tau, k, N, boil, osc };
+}
+const smooth = (x) => { x = Math.max(0, Math.min(1, x)); return x * x * (3 - 2 * x); };
+
+// ---------- The Boxer ----------
+function drawBoxer(canvas, seed, opt = {}) {
+  const W = 1000, H = 1250;
+  const { ctx, tau, k: nr, N, boil } = mcFrame(canvas, W, H, BOXER_LOOP, opt);
+  const rand = mulberry32(seed * 7907 + 3);
+  const vn = valueNoise(seed * 17 + 11);
+  const C = {
+    ink: '#050506', white: '#f3efe6', blue: '#3a55c2', red: '#d4482a', redDark: '#a8351e', ochre: '#d8a443',
+    cone: '#10121b', skin: '#c27f55', skinDark: '#94573a', skinLit: '#d99a6c',
+  };
+  const { fill, line, taper, at, jit, brush } = pen(ctx, vn, rand, boil);
+
+  // Two punches per loop. p runs from 0 to 1 per punch; at p = 0 the glove lands (the still).
+  // After the hit it holds briefly, pulls back to the shoulder, waits and snaps forward in just over two drawings.
+  const p = (2 * tau) % 1;
+  const reach = p < 0.2 ? 1 : p < 0.55 ? 1 - smooth((p - 0.2) / 0.35) : p < 0.86 ? 0 : Math.pow((p - 0.86) / 0.14, 2);
+  const gs = 1 - 0.2 * (1 - reach) + (p < 0.1 ? 0.03 * Math.sin(Math.PI * p / 0.1) : 0);
+  const gdx = 40 * (1 - reach) + (p < 0.1 ? 4 * Math.sin(p * 190) : 0), gdy = -26 * (1 - reach) + (p < 0.1 ? 3 * Math.cos(p * 150) : 0);
+  const glove = (fn) => { ctx.save(); ctx.translate(540 + gdx, 470 + gdy); ctx.scale(gs, gs); ctx.translate(-540, -470); fn(); ctx.restore(); };
+
+  ground(ctx, rand, taper);
+
+  // --- Flat light cone of the arena lamp
+  fill('M 430 -20 L 780 -20 L 1060 1270 L 150 1270 Z', C.cone, 3);
+
+  // --- Lights and camera flashes in the dark crowd. The dots stay still. Each flash fires once per loop,
+  // most of them at the moment of the hit, and lasts two drawings: big with a faint halo, then small.
+  const star = (x, y, s) => fill(`M ${x} ${y - s * 1.6} L ${x + s * 0.3} ${y - s * 0.3} L ${x + s * 1.6} ${y} L ${x + s * 0.3} ${y + s * 0.3} L ${x} ${y + s * 1.6} L ${x - s * 0.3} ${y + s * 0.3} L ${x - s * 1.6} ${y} L ${x - s * 0.3} ${y - s * 0.3} Z`, C.white, 0.4);
+  for (let k = 0; k < 18; k++) {
+    const x = 20 + rand() * 560, y = 30 + rand() * 380, s = 5 + rand() * 9, col = rand() < 0.5 ? C.ochre : C.white, a = 0.45 + rand() * 0.45;
+    ctx.fillStyle = col; ctx.globalAlpha = a; ctx.beginPath(); ctx.arc(x, y, s * 0.5, 0, Math.PI * 2); ctx.fill(); ctx.globalAlpha = 1;
+  }
+  const half = N / 2, hits = [0, 0, 1, 0, 1, half, half, half + 1];
+  for (let k = 0; k < 13; k++) {
+    const x = 30 + rand() * 540, y = 40 + rand() * 360, s = 8 + rand() * 9, rnd = Math.floor(rand() * N);
+    const age = (((nr - (k < hits.length ? hits[k] : rnd)) % N) + N) % N;
+    if (age === 0) {
+      ctx.fillStyle = C.white; ctx.globalAlpha = 0.16; ctx.beginPath(); ctx.arc(x, y, s * 2.4, 0, Math.PI * 2); ctx.fill(); ctx.globalAlpha = 1;
+      star(x, y, s * 1.25);
+    } else if (age === 1) { ctx.globalAlpha = 0.75; star(x, y, s * 0.7); ctx.globalAlpha = 1; }
+  }
+
+  // --- Corner post and three ropes: red, white, blue
+  fill('M 858 -20 L 922 -20 L 926 1270 L 862 1270 Z', C.ochre);
+  brush('M 872 -20 L 876 1270', C.ink, 3);
+  const ropes = [[70, 130, C.red], [380, 372, C.white], [1150, 650, C.blue]];
+  ropes.forEach(([y0, y1, col]) => {
+    const sag = 40 + jit(10);
+    taper([[-30, y0], [420, (y0 + y1) / 2 + sag], [870, y1]], 24, 16, col, 30, false);
+    brush(`M -30 ${y0 + 9} Q 420 ${(y0 + y1) / 2 + sag + 9} 870 ${y1 + 7}`, C.ink, 2.5);
+    fill(`M 840 ${y1 - 30} L 940 ${y1 - 34} L 944 ${y1 + 28} L 844 ${y1 + 32} Z`, C.white);
+    brush(`M 846 ${y1 + 1} L 938 ${y1 - 3}`, C.ink, 2.6);
+  });
+
+  // --- Body: torso, trunks
+  fill('M 604 356 L 694 352 L 704 446 L 598 452 Z', C.skinDark);
+  fill('M 430 452 L 560 420 L 720 418 L 850 446 L 884 560 L 834 760 L 806 930 L 560 930 L 522 760 L 452 604 Z', C.skin);
+  fill('M 760 430 L 850 446 L 884 560 L 834 760 L 806 930 L 744 930 L 782 760 L 804 560 Z', C.skinDark);
+  brush('M 580 474 L 642 490 L 704 474', C.ink, 3);
+  brush('M 540 604 C 580 646 626 648 652 606', C.ink, 3);
+  brush('M 652 606 C 690 648 740 646 784 602', C.ink, 3);
+  brush('M 652 610 L 656 900', C.ink, 3);
+  for (const y of [700, 780, 852]) { brush(`M 606 ${y} L 640 ${y + 6}`, C.ink, 3); brush(`M 670 ${y + 6} L 708 ${y}`, C.ink, 3); }
+  fill('M 548 924 L 812 924 L 866 1270 L 494 1270 Z', C.blue);
+  fill('M 552 900 L 810 900 L 816 962 L 546 962 Z', C.white);
+  brush('M 560 931 L 808 930', C.ink, 2.6);
+  fill('M 784 962 L 812 962 L 850 1270 L 820 1270 Z', C.red);
+  brush('M 672 966 L 650 1270', C.ink, 3);
+
+  // --- Head: small and far away, clenched mouthguard, tape on the nose
+  at(652, 290, 0.08, () => {
+    fill('M -66 -8 L -50 -14 L -48 18 L -62 22 Z', C.skin);
+    fill('M 52 -12 L 70 -16 L 72 16 L 54 22 Z', C.skinDark);
+    fill('M -50 -60 L 46 -64 L 56 -10 L 48 36 L 24 66 L -8 72 L -34 62 L -50 34 L -58 -6 Z', C.skin);
+    fill('M 18 -62 L 46 -64 L 56 -10 L 48 36 L 24 66 L 6 70 L 26 28 L 24 -18 Z', C.skinDark);
+    fill('M -50 -40 L -32 -38 L -36 0 L -56 -4 Z', C.skinLit);
+    fill('M -56 -54 C -58 -104 44 -112 52 -60 L 46 -64 L -50 -58 Z', C.ink);
+    fill('M -42 -36 L -10 -26 L -12 -18 L -44 -28 Z', C.ink);
+    fill('M 10 -26 L 42 -38 L 44 -30 L 12 -18 Z', C.ink);
+    brush('M -38 -10 L -16 -8', C.ink, 4); brush('M 14 -8 L 36 -11', C.ink, 4);
+    brush('M -2 -12 L -8 22 L 8 24', C.ink, 3);
+    fill('M -18 2 L 14 -1 L 14 10 L -18 13 Z', C.white);
+    fill('M -24 38 L 24 35 L 22 50 L -22 53 Z', C.white);
+    line('M -24 38 L 24 35 L 22 50 L -22 53 Z', C.ink, 3);
+    brush('M -8 37 L -8 52', C.ink, 2); brush('M 8 36 L 8 51', C.ink, 2);
+    brush('M -46 30 L -34 52', C.ink, 2.5);
+  });
+
+  // --- Sweat flying off to the right at the hit: flies for 0.8 s, falls a little and shrinks
+  for (let k = 0; k < 9; k++) {
+    const x = 730 + rand() * 170, y = 150 + rand() * 170, a = -0.3 + jit(0.4), r = 4 + rand() * 5, v = 120 + rand() * 90;
+    const u = p / 0.55;
+    if (u >= 1) continue;
+    const d = v * (1 - Math.pow(1 - u, 2)), rr = r * (1 - u * u * u);
+    at(x + Math.cos(a) * d, y + Math.sin(a) * d + 50 * u * u, a + 0.4 * u, () => fill(`M ${-rr * 3} 0 Q 0 ${-rr} ${rr} 0 Q 0 ${rr} ${-rr * 3} 0 Z`, C.white, 0.4));
+  }
+
+  // --- Guard arm: upper arm in shadow at the flank, lit forearm across the chest, shadow wedge below
+  fill('M 836 446 L 892 472 L 912 650 L 876 712 L 826 690 Z', C.skinDark);
+  fill('M 686 486 L 714 468 L 776 624 Z', C.ink);
+  fill('M 712 458 L 804 466 L 874 668 C 872 700 838 718 808 704 Z', C.skinLit);
+  brush('M 770 492 C 796 560 816 618 832 676', C.skin, 5);
+  fill('M 712 420 L 804 432 L 796 470 L 706 458 Z', C.white);
+  brush('M 730 424 L 724 462', C.ink, 2.5); brush('M 760 428 L 754 466', C.ink, 2.5);
+  fill('M 690 262 C 698 210 800 196 842 238 C 874 282 864 382 822 424 C 782 452 722 442 702 402 C 682 362 680 304 690 262 Z', C.red);
+  fill('M 800 214 C 846 236 870 300 852 370 C 840 410 816 430 790 440 C 820 380 824 290 800 214 Z', C.redDark);
+  brush('M 700 330 C 730 312 770 316 800 344', C.ink, 3);
+  fill('M 712 246 C 730 222 762 214 786 220 C 758 230 736 246 722 270 Z', C.white, 0.6);
+
+  // --- The punch: short, foreshortened arm and a glove bigger than the head
+  fill('M 430 452 L 562 424 L 560 560 L 400 600 Z', C.skin);
+  fill('M 500 436 L 562 424 L 560 560 L 520 570 Z', C.skinDark);
+  // Impact lines only at the moment of the hit: they jump outwards and are gone after a quarter of a second.
+  const burst = p < 0.17 ? 1 - Math.pow(1 - p / 0.17, 2) : -1;
+  for (let k = 0; k < 7; k++) {
+    const a = Math.PI * (0.62 + k * 0.17) + jit(0.06), r0 = 290 + rand() * 20, r1 = r0 + 40 + rand() * 50;
+    if (burst < 0) continue;
+    const g0 = r0 + 70 * burst, g1 = r1 + 110 * burst - 30 * burst * burst;
+    brush(`M ${330 + Math.cos(a) * g0} ${690 + Math.sin(a) * g0 * 0.9} L ${330 + Math.cos(a) * g1} ${690 + Math.sin(a) * g1 * 0.9}`, C.white, 4, 0.4);
+  }
+  glove(() => {
+  fill('M 486 430 L 590 462 L 574 524 L 470 492 Z', C.white);
+  brush('M 506 440 L 494 498', C.ink, 2.5); brush('M 538 450 L 526 508', C.ink, 2.5);
+  fill('M 88 560 C 96 448 258 398 382 418 C 522 438 604 520 592 640 C 602 700 592 762 562 802 C 604 842 594 902 542 922 C 482 944 420 912 400 882 C 320 924 196 924 136 862 C 76 800 78 680 88 560 Z', C.red);
+  fill('M 592 640 C 602 700 592 762 562 802 C 604 842 594 902 542 922 C 482 944 420 912 400 882 C 320 924 196 924 136 862 C 236 892 380 870 470 820 C 540 780 584 720 592 640 Z', C.redDark);
+  brush('M 132 610 C 250 562 430 560 574 616', C.ink, 3.5);
+  brush('M 562 802 C 520 792 480 822 458 874', C.ink, 3.5);
+  brush('M 470 826 C 500 850 530 870 560 880', C.ink, 2.5);
+  fill('M 140 540 C 176 476 262 448 330 456 C 268 476 206 508 166 566 Z', C.white, 0.8);
+  fill('M 180 600 C 196 584 214 576 232 574 C 214 590 200 604 190 622 Z', C.white, 0.5);
+  });
+
+  chalkFixed(ctx, seed * 131 + 29);
+}
+
+// ---------- Player ----------
+// Draws only when the time reaches a new drawing (12 per second). Respects reduced motion.
+(function () {
+  const canvas = document.getElementById('art');
+  let last = null;
+  const show = (t) => {
+    const n = Math.floor(t * MC_FPS + 1e-6);
+    if (n === last) return;
+    last = n; drawBoxer(canvas, params.seed, { t, scale: params.scale, boil: params.boil });
+  };
+  show(0);
+  if (!params.animate || matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+  const start = performance.now();
+  const loop = () => { show(((performance.now() - start) / 1000) % BOXER_LOOP); requestAnimationFrame(loop); };
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
