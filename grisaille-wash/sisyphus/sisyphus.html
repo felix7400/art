@@ -1,0 +1,1385 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Sisyphus · grisaille wash</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #1d1d1c; }
+  body { display: grid; place-items: center; }
+  canvas { display: block; max-width: 100vw; max-height: 100vh; }
+</style>
+<canvas id="art" role="img" aria-label="A grey watercolour loop: a man in a frock coat and top hat pushes a boulder up a misty hill, lets it roll back, looks out into the light and walks back down with his hands behind his back."></canvas>
+<script>
+/* grisaille.js — drawing library for the style "Grisaille Wash" (Canvas 2D, no dependencies).
+ *
+ * Everything is grey watercolour on warm paper: one pigment, many dilutions. Light is the paper
+ * left untouched; fog is paper lifted back over the paint. Every wash is built the way a brush
+ * lays it down:
+ *   1. the shape is deformed recursively (Tyler Hobbs' polygon method) and stacked 20–40 times
+ *      at low opacity, so edges are soft and uneven but the body is solid;
+ *   2. pigment collects at the drying edge (edge darkening: the shape minus its own blur);
+ *   3. the density is broken by low-frequency mottling and paper grain (granulation);
+ *   4. the result is multiplied onto the paper, so layers glaze like real transparent paint.
+ *
+ * All randomness runs through seeded generators (GW.rng). Nothing depends on time or Math.random,
+ * so a scene renders the same on every machine and every frame of an animation can be redrawn alone.
+ *
+ * Main API (x right, y down, units px):
+ *   GW.palette                      paper, ink and the tone ladder
+ *   GW.rng(seed)                    mulberry32 → () => 0..1;  GW.gauss(r)
+ *   GW.noise(seed) → (x, y) => -1..1   gradient noise;  GW.fbm(n, x, y, oct)
+ *   GW.canvas(w, h)                 offscreen canvas
+ *   GW.textures(w, h, seed)         paper grain, granulation and mottle textures (made once per size)
+ *   GW.paper(ctx, w, h, T)          paints the bare paper
+ *   GW.deform(poly, depth, v, r)    recursive midpoint deformation
+ *   GW.wash(ctx, poly, o)           one watercolour wash (see options below)
+ *   GW.bloom(ctx, x, y, rad, o)     back-run (cauliflower edge): lighter inside, dark fractal rim
+ *   GW.trunk(ctx, o)                a tree trunk: wobbly sides, darker edges, streaks, wet fade
+ *   GW.fog(ctx, blobs, o)           lifted paper: soft bands of fog
+ *   GW.dash(ctx, x0, y0, x1, y1, o) the cast-shadow stroke under figures
+ *   GW.gentleman(ctx, P)            the figure: frock coat, top hat, 2.5D puppet with IK
+ *   GW.stoneTexture(R, seed) / GW.stone(ctx, tex, x, y, R, angle, o)
+ *   GW.birds(ctx, list, t)          tiny far birds
+ */
+(function (G) {
+  'use strict';
+  const GW = {};
+
+  // ---------- palette ----------
+  // One pigment (a neutral Payne's grey) on warm paper. Tones are pigment strength 0..1.
+  GW.palette = {
+    paper: '#ECE9E2',      // bare paper, also the colour of fog and light
+    paperShade: '#E2DED5', // paper in the shadow of the page (vignette)
+    ink: '#1C1D1F',        // full-strength pigment
+    pigment: '#2B2D30',    // the wash colour that is multiplied in
+    ladder: [0.06, 0.12, 0.2, 0.3, 0.42, 0.55, 0.7, 0.85, 0.95],
+  };
+  const hex = (h) => [parseInt(h.slice(1, 3), 16), parseInt(h.slice(3, 5), 16), parseInt(h.slice(5, 7), 16)];
+  GW.hex = hex;
+  /** Colour of a tone painted on paper: 0 = paper, 1 = ink. */
+  GW.tone = (t, alpha = 1) => {
+    const p = hex(GW.palette.paper), k = hex(GW.palette.ink);
+    const c = p.map((v, i) => Math.round(v + (k[i] - v) * t));
+    return alpha >= 1 ? `rgb(${c[0]},${c[1]},${c[2]})` : `rgba(${c[0]},${c[1]},${c[2]},${alpha})`;
+  };
+  GW.paperRGBA = (a) => { const p = hex(GW.palette.paper); return `rgba(${p[0]},${p[1]},${p[2]},${a})`; };
+
+  // ---------- randomness ----------
+  GW.rng = function (a) {
+    a = (a | 0) || 1;
+    return function () {
+      a = (a + 0x6D2B79F5) | 0;
+      let t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  };
+  GW.gauss = (r) => { let u = 0, v = 0; while (u === 0) u = r(); v = r(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); };
+
+  /** 2D gradient noise, seeded. Returns (x, y) => about -1..1. */
+  GW.noise = function (seed) {
+    const r = GW.rng(seed * 9301 + 49297), perm = new Uint8Array(512), gx = new Float32Array(256), gy = new Float32Array(256);
+    const p = [...Array(256).keys()];
+    for (let i = 255; i > 0; i--) { const j = Math.floor(r() * (i + 1)); [p[i], p[j]] = [p[j], p[i]]; }
+    for (let i = 0; i < 512; i++) perm[i] = p[i & 255];
+    for (let i = 0; i < 256; i++) { const a = r() * Math.PI * 2; gx[i] = Math.cos(a); gy[i] = Math.sin(a); }
+    const f = (t) => t * t * t * (t * (t * 6 - 15) + 10);
+    return function (x, y) {
+      const xi = Math.floor(x), yi = Math.floor(y), xf = x - xi, yf = y - yi;
+      const X = xi & 255, Y = yi & 255;
+      const g = (i, j, dx, dy) => { const h = perm[perm[X + i] + Y + j]; return gx[h] * dx + gy[h] * dy; };
+      const n00 = g(0, 0, xf, yf), n10 = g(1, 0, xf - 1, yf), n01 = g(0, 1, xf, yf - 1), n11 = g(1, 1, xf - 1, yf - 1);
+      const u = f(xf), v = f(yf);
+      return 1.41 * ((n00 + (n10 - n00) * u) + ((n01 + (n11 - n01) * u) - (n00 + (n10 - n00) * u)) * v);
+    };
+  };
+  GW.fbm = (n, x, y, oct = 4, lac = 2, gain = 0.5) => { let s = 0, a = 1, w = 0; for (let i = 0; i < oct; i++) { s += a * n(x, y); w += a; x *= lac; y *= lac; a *= gain; } return s / w; };
+
+  // ---------- canvases and textures ----------
+  GW.canvas = (w, h) => { const c = document.createElement('canvas'); c.width = Math.max(1, Math.ceil(w)); c.height = Math.max(1, Math.ceil(h)); return c; };
+
+  /** Alpha texture from a function f(x, y) → 0..1, computed at 1/step resolution and smoothed up. */
+  GW.alphaTexture = function (w, h, step, f) {
+    const sw = Math.ceil(w / step) + 1, sh = Math.ceil(h / step) + 1, small = GW.canvas(sw, sh), sx = small.getContext('2d');
+    const img = sx.createImageData(sw, sh), d = img.data;
+    for (let j = 0; j < sh; j++) for (let i = 0; i < sw; i++) {
+      const k = (j * sw + i) * 4, a = Math.max(0, Math.min(1, f(i * step, j * step)));
+      d[k] = d[k + 1] = d[k + 2] = 0; d[k + 3] = Math.round(a * 255);
+    }
+    sx.putImageData(img, 0, 0);
+    if (step === 1) return small;
+    const big = GW.canvas(w, h), bx = big.getContext('2d');
+    bx.imageSmoothingEnabled = true; bx.imageSmoothingQuality = 'high';
+    bx.drawImage(small, 0, 0, sw * step, sh * step);
+    return big;
+  };
+
+  /**
+   * The paper textures every wash is filtered through. Made once per canvas size.
+   *  grain:   fine tooth of cold-pressed paper (1–3 px), alpha 0.62..1 → granulation
+   *  mottle:  slow pigment variation inside a wash (40–300 px), alpha 0.45..1
+   *  streak:  mottle stretched vertically, for trunks
+   *  tooth:   the paper surface itself (very light), multiplied on top of everything at the end
+   */
+  GW.textures = function (w, h, seed = 7) {
+    const key = `${w}x${h}:${seed}`;
+    GW._tex = GW._tex || {};
+    if (GW._tex[key]) return GW._tex[key];
+    const n1 = GW.noise(seed), n2 = GW.noise(seed + 1), n3 = GW.noise(seed + 2), r = GW.rng(seed + 3);
+    const grain = (() => {
+      const c = GW.canvas(w, h), x = c.getContext('2d'), img = x.createImageData(w, h), d = img.data;
+      const sm = (a, b, t) => { t = Math.max(0, Math.min(1, (t - a) / (b - a))); return t * t * (3 - 2 * t); };
+      for (let j = 0; j < h; j++) for (let i = 0; i < w; i++) {
+        const k = (j * w + i) * 4;
+        // clumps of 2–6 px (pigment settling in the paper's valleys), some fine speckle, slow variation of how much it granulates
+        const fine = r(), clump = n1(i * 0.28, j * 0.28) * 0.5 + 0.5, clump2 = n2(i * 0.11 + 40, j * 0.11) * 0.5 + 0.5, coarse = n2(i * 0.02, j * 0.02) * 0.5 + 0.5;
+        const v = 0.22 * fine + 0.48 * clump + 0.3 * clump2;
+        const a = 0.68 + 0.32 * sm(0.3 - 0.12 * coarse, 0.75, v);
+        d[k] = d[k + 1] = d[k + 2] = 0; d[k + 3] = Math.round(255 * a);
+      }
+      x.putImageData(img, 0, 0);
+      return c;
+    })();
+    const mottle = GW.alphaTexture(w, h, 4, (x, y) => {
+      const wx = x + 60 * n3(x * 0.004, y * 0.004), wy = y + 60 * n3(x * 0.004 + 9, y * 0.004 + 9);
+      const v = GW.fbm(n1, wx * 0.0045, wy * 0.0045, 5) * 0.5 + 0.5;
+      return 0.45 + 0.55 * Math.pow(Math.min(1, Math.max(0, v * 1.15 - 0.05)), 0.9);
+    });
+    const streak = GW.alphaTexture(w, h, 3, (x, y) => {
+      const v = GW.fbm(n2, x * 0.06, y * 0.0035, 4) * 0.5 + 0.5;
+      return 0.5 + 0.5 * v;
+    });
+    // blotches: pigment pools with dried tide lines (the cloudy back-runs of a wet wash)
+    const n4 = GW.noise(seed + 4), n5 = GW.noise(seed + 5);
+    const blotch = GW.alphaTexture(w, h, 1, (x, y) => {
+      const wx = x + 110 * n4(x * 0.0025, y * 0.0025) + 10 * n5(x * 0.035, y * 0.035), wy = y + 110 * n4(x * 0.0025 + 5.2, y * 0.0025 + 1.3) + 10 * n5(x * 0.035 + 7, y * 0.035);
+      const v = GW.fbm(n3, wx * 0.0026, wy * 0.0026, 4);
+      const sm = (a, b, t) => { t = Math.max(0, Math.min(1, (t - a) / (b - a))); return t * t * (3 - 2 * t); };
+      const pool = sm(0.02, 0.1, v);                                              // where the pigment pooled
+      const where = sm(0.05, 0.35, n5(x * 0.0018 + 3, y * 0.0018));               // tide lines only in some places
+      const tide = Math.exp(-Math.pow((v - 0.1) / 0.011, 2)) * where;
+      const soft = GW.fbm(n5, x * 0.01, y * 0.01, 3) * 0.5 + 0.5;
+      return 0.5 + 0.22 * pool + 0.32 * tide + 0.12 * (soft - 0.5);
+    });
+    const tooth = GW.alphaTexture(w, h, 1, (x, y) => {
+      const v = n1(x * 0.5 + 300, y * 0.5) * 0.5 + 0.5, f = n2(x * 0.11, y * 0.11) * 0.5 + 0.5;
+      return 0.035 + 0.05 * v * f;
+    });
+    return (GW._tex[key] = { w, h, grain, mottle, streak, tooth, blotch });
+  };
+
+  /** Bare paper: warm base, a little uneven tone, darker towards the page edge. */
+  GW.paper = function (ctx, w, h, T) {
+    ctx.save();
+    ctx.fillStyle = GW.palette.paper; ctx.fillRect(0, 0, w, h);
+    const g = ctx.createRadialGradient(w * 0.55, h * 0.45, Math.min(w, h) * 0.35, w * 0.5, h * 0.5, Math.hypot(w, h) * 0.62);
+    g.addColorStop(0, 'rgba(0,0,0,0)'); g.addColorStop(1, 'rgba(60,55,45,0.10)');
+    ctx.fillStyle = g; ctx.fillRect(0, 0, w, h);
+    ctx.restore();
+  };
+
+  /** The paper tooth, laid over everything at the very end (multiply). */
+  GW.tooth = function (ctx, T, a = 1) {
+    ctx.save(); ctx.globalCompositeOperation = 'multiply'; ctx.globalAlpha = a;
+    const c = GW._toothTint || (GW._toothTint = {});
+    const key = T.w + 'x' + T.h;
+    if (!c[key]) { const t = GW.canvas(T.w, T.h), x = t.getContext('2d'); x.drawImage(T.tooth, 0, 0); x.globalCompositeOperation = 'source-in'; x.fillStyle = '#3a3328'; x.fillRect(0, 0, T.w, T.h); c[key] = t; }
+    ctx.drawImage(c[key], 0, 0);
+    ctx.restore();
+  };
+
+  // ---------- shapes ----------
+  /** Recursive midpoint deformation. poly: [[x, y, v?]], v = local variance (default 1). */
+  GW.deform = function (poly, depth, variance, r) {
+    let p = poly.map((q) => [q[0], q[1], q[2] == null ? 1 : q[2]]);
+    for (let d = 0; d < depth; d++) {
+      const out = [];
+      for (let i = 0; i < p.length; i++) {
+        const a = p[i], b = p[(i + 1) % p.length];
+        out.push(a);
+        const len = Math.hypot(b[0] - a[0], b[1] - a[1]);
+        const v = (a[2] + b[2]) * 0.5 * (0.6 + 0.8 * r());
+        const sd = len * variance * v;
+        out.push([(a[0] + b[0]) / 2 + GW.gauss(r) * sd, (a[1] + b[1]) / 2 + GW.gauss(r) * sd, v]);
+      }
+      p = out;
+    }
+    return p;
+  };
+  /** Subdivide a polygon so no edge is longer than maxLen (keeps per-vertex variance). */
+  GW.densify = function (poly, maxLen) {
+    const out = [];
+    for (let i = 0; i < poly.length; i++) {
+      const a = poly[i], b = poly[(i + 1) % poly.length], n = Math.max(1, Math.ceil(Math.hypot(b[0] - a[0], b[1] - a[1]) / maxLen));
+      for (let k = 0; k < n; k++) { const t = k / n; out.push([a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, (a[2] == null ? 1 : a[2]) * (1 - t) + (b[2] == null ? 1 : b[2]) * t]); }
+    }
+    return out;
+  };
+  GW.path = (ctx, p) => { ctx.beginPath(); ctx.moveTo(p[0][0], p[0][1]); for (let i = 1; i < p.length; i++) ctx.lineTo(p[i][0], p[i][1]); ctx.closePath(); };
+  GW.bbox = (p, pad = 0) => { let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9; for (const q of p) { if (q[0] < x0) x0 = q[0]; if (q[0] > x1) x1 = q[0]; if (q[1] < y0) y0 = q[1]; if (q[1] > y1) y1 = q[1]; } return { x: Math.floor(x0 - pad), y: Math.floor(y0 - pad), w: Math.ceil(x1 - x0 + 2 * pad), h: Math.ceil(y1 - y0 + 2 * pad) }; };
+  GW.circlePoly = (cx, cy, rx, ry = rx, n = 24, v = 1) => Array.from({ length: n }, (_, i) => { const a = (i / n) * Math.PI * 2; return [cx + Math.cos(a) * rx, cy + Math.sin(a) * ry, v]; });
+
+  // ---------- the wash ----------
+  /**
+   * One watercolour wash, multiplied onto ctx.
+   * o.tone      pigment strength 0..1 (default 0.3)
+   * o.seed      seed for the deformation
+   * o.layers    number of stacked deformed copies (default 28)
+   * o.spread    deformation of the base shape (default 0.06), o.jitter of each layer (default 0.04)
+   * o.depth     recursion depth (default 4)
+   * o.edge      edge darkening strength 0..1 (default 0.55), o.edgeWidth in px (default 6)
+   * o.mottle    0..1 how much slow variation (default 0.7), o.grain 0..1 granulation (default 0.8)
+   * o.soft      blur in px for wet edges (default 0)
+   * o.fade      [{x0,y0,x1,y1,stops:[[t,a],…]}] alpha gradients multiplied in (wet-in-wet fade)
+   * o.clip      polygon or function(ctx) restricting the wash
+   * o.T         textures from GW.textures (required)
+   * o.mode      composite operation (default 'multiply')
+   * o.into      draw into this canvas instead of compositing (returns the layer)
+   */
+  GW.wash = function (ctx, poly, o = {}) {
+    const T = o.T, r = GW.rng(o.seed == null ? 1 : o.seed);
+    const layers = o.layers ?? 28, depth = o.depth ?? 4, spread = o.spread ?? 0.06, jitter = o.jitter ?? 0.04;
+    const base0 = GW.densify(poly, o.maxLen ?? 120);
+    const base = GW.deform(base0, Math.max(1, depth - 2), spread, r);
+    const bb = GW.bbox(base, 40 + (o.soft || 0) * 3 + (o.edgeWidth ?? 6) * 3);
+    const L = GW.canvas(bb.w, bb.h), x = L.getContext('2d');
+    x.translate(-bb.x, -bb.y);
+    if (o.clip) { if (typeof o.clip === 'function') o.clip(x); else { GW.path(x, o.clip); x.clip(); } }
+    if (o.soft) x.filter = `blur(${o.soft}px)`;
+    x.fillStyle = '#000';
+    const a = 1 - Math.pow(1 - (o.body ?? 0.93), 1 / layers);   // per-layer alpha so the stack reaches `body`
+    for (let i = 0; i < layers; i++) {
+      const p = GW.deform(base, 2, jitter, r);
+      x.globalAlpha = a; GW.path(x, p); x.fill();
+    }
+    x.filter = 'none'; x.globalAlpha = 1;
+    x.setTransform(1, 0, 0, 1, 0, 0);
+    // edge darkening: rim = shape − blur(shape)
+    const edge = o.edge ?? 0.55;
+    if (edge > 0) {
+      const B = GW.canvas(bb.w, bb.h), bx = B.getContext('2d');
+      bx.filter = `blur(${o.edgeWidth ?? 6}px)`; bx.drawImage(L, 0, 0); bx.filter = 'none';
+      const R = GW.canvas(bb.w, bb.h), rx = R.getContext('2d');
+      rx.drawImage(L, 0, 0); rx.globalCompositeOperation = 'destination-out'; rx.drawImage(B, 0, 0);
+      x.globalAlpha = edge; x.drawImage(R, 0, 0); x.globalAlpha = 1;
+    }
+    // wet-in-wet fades
+    if (o.fade) for (const f of o.fade) {
+      const g = x.createLinearGradient(f.x0 - bb.x, f.y0 - bb.y, f.x1 - bb.x, f.y1 - bb.y);
+      for (const [t, al] of f.stops) g.addColorStop(t, `rgba(0,0,0,${al})`);
+      x.globalCompositeOperation = 'destination-in'; x.fillStyle = g; x.fillRect(0, 0, bb.w, bb.h);
+    }
+    if (o.radial) for (const f of o.radial) {
+      const g = x.createRadialGradient(f.x - bb.x, f.y - bb.y, f.r0, f.x - bb.x, f.y - bb.y, f.r1);
+      for (const [t, al] of f.stops) g.addColorStop(t, `rgba(0,0,0,${al})`);
+      x.globalCompositeOperation = 'destination-in'; x.fillStyle = g; x.fillRect(0, 0, bb.w, bb.h);
+    }
+    // mottling and granulation (sampled at a seeded offset so washes differ)
+    if (T) {
+      const mot = o.mottle ?? 0.7, gr = o.grain ?? 0.8;
+      const tex = o.streaky ? T.streak : T.mottle;
+      if (mot > 0) {
+        x.globalCompositeOperation = 'destination-out'; x.globalAlpha = mot;
+        const [ax, ay] = GW.anchor(tex, bb, r);
+        GW.tile(x, GW._inverse(tex), ax, ay, bb.w, bb.h);
+        x.globalAlpha = 1;
+      }
+      const bl = o.blotch ?? 0;
+      if (bl > 0) {
+        x.globalCompositeOperation = 'destination-out'; x.globalAlpha = bl;
+        const [ax, ay] = GW.anchor(T.blotch, bb, r);
+        GW.tile(x, GW._inverse(T.blotch), ax, ay, bb.w, bb.h);
+        x.globalAlpha = 1;
+      }
+      if (gr > 0) {
+        x.globalCompositeOperation = 'destination-out'; x.globalAlpha = gr;
+        GW.tile(x, GW._inverse(T.grain), bb.x, bb.y, bb.w, bb.h);
+        x.globalAlpha = 1;
+      }
+    }
+    // colour it
+    x.globalCompositeOperation = 'source-in'; x.fillStyle = o.color || GW.palette.pigment; x.fillRect(0, 0, bb.w, bb.h);
+    x.globalCompositeOperation = 'source-over';
+    if (o.into) { const c = o.into.getContext('2d'); c.save(); c.globalAlpha = o.tone ?? 0.3; c.globalCompositeOperation = o.mode || 'source-over'; c.drawImage(L, bb.x, bb.y); c.restore(); return L; }
+    ctx.save(); ctx.globalCompositeOperation = o.mode || 'multiply'; ctx.globalAlpha = o.tone ?? 0.3; ctx.drawImage(L, bb.x, bb.y); ctx.restore();
+    return { layer: L, x: bb.x, y: bb.y };
+  };
+  /** Inverted alpha copy of a texture (cached): alpha' = 1 − alpha. */
+  GW._inverse = function (tex) {
+    tex.__inv = tex.__inv || (() => {
+      const c = GW.canvas(tex.width, tex.height), x = c.getContext('2d');
+      x.fillStyle = '#000'; x.fillRect(0, 0, c.width, c.height);
+      x.globalCompositeOperation = 'destination-out'; x.drawImage(tex, 0, 0);
+      return c;
+    })();
+    return tex.__inv;
+  };
+
+  /** Tile a texture over a w x h layer whose top-left sits at world (wx, wy): texture is anchored to world space. */
+  /** Where to sample a texture for a layer at bb: inside one tile when it fits (no seam), else anchored to the world. */
+  GW.anchor = function (tex, bb, r) {
+    const tw = tex.width, th = tex.height;
+    return [bb.w < tw ? Math.floor(r() * (tw - bb.w)) : bb.x, bb.h < th ? Math.floor(r() * (th - bb.h)) : bb.y];
+  };
+  GW.tile = function (x, tex, wx, wy, w, h) {
+    const tw = tex.width, th = tex.height;
+    const sx = -(((wx % tw) + tw) % tw), sy = -(((wy % th) + th) % th);
+    for (let yy = sy; yy < h; yy += th) for (let xx = sx; xx < w; xx += tw) x.drawImage(tex, xx, yy);
+  };
+
+  /** Back-run (bloom): water creeping into a drying wash. Lifts pigment inside, leaves a dark fractal rim. */
+  GW.bloom = function (ctx, cx, cy, rad, o = {}) {
+    const r = GW.rng(o.seed ?? 3), T = o.T;
+    const poly = GW.deform(GW.circlePoly(cx, cy, rad, rad * (o.squash ?? 0.75), 10), 5, o.rough ?? 0.22, r);
+    const bb = GW.bbox(poly, 20), L = GW.canvas(bb.w, bb.h), x = L.getContext('2d');
+    x.translate(-bb.x, -bb.y); x.fillStyle = '#000'; GW.path(x, poly); x.fill(); x.setTransform(1, 0, 0, 1, 0, 0);
+    const B = GW.canvas(bb.w, bb.h), bx = B.getContext('2d'); bx.filter = `blur(${o.rim ?? 3}px)`; bx.drawImage(L, 0, 0); bx.filter = 'none';
+    const R = GW.canvas(bb.w, bb.h), rx = R.getContext('2d'); rx.drawImage(L, 0, 0); rx.globalCompositeOperation = 'destination-out'; rx.drawImage(B, 0, 0);
+    if (T) { rx.globalCompositeOperation = 'destination-out'; rx.globalAlpha = 0.6; GW.tile(rx, GW._inverse(T.grain), bb.x, bb.y, bb.w, bb.h); rx.globalAlpha = 1; }
+    rx.globalCompositeOperation = 'source-in'; rx.fillStyle = GW.palette.pigment; rx.fillRect(0, 0, bb.w, bb.h);
+    ctx.save();
+    // lift inside
+    if ((o.lift ?? 0.35) > 0) {
+      const I = GW.canvas(bb.w, bb.h), ix = I.getContext('2d'); ix.filter = 'blur(2px)'; ix.drawImage(L, 0, 0); ix.filter = 'none';
+      ix.globalCompositeOperation = 'source-in'; ix.fillStyle = GW.palette.paper; ix.fillRect(0, 0, bb.w, bb.h);
+      ctx.globalAlpha = o.lift ?? 0.35; ctx.drawImage(I, bb.x, bb.y);
+    }
+    ctx.globalCompositeOperation = 'multiply'; ctx.globalAlpha = o.tone ?? 0.5; ctx.drawImage(R, bb.x, bb.y);
+    ctx.restore();
+  };
+
+  /** Lifted paper: fog. blobs = [[x, y, rx, ry, alpha]]. Drawn into ctx as paper colour (source-over). */
+  GW.fog = function (ctx, blobs, o = {}) {
+    const r = GW.rng(o.seed ?? 5);
+    ctx.save();
+    ctx.filter = `blur(${o.blur ?? 30}px)`;
+    for (const [x, y, rx, ry, a] of blobs) {
+      const p = GW.deform(GW.circlePoly(x, y, rx, ry, 12), 4, o.rough ?? 0.12, r);
+      ctx.globalAlpha = a; ctx.fillStyle = o.color || GW.palette.paper; GW.path(ctx, p); ctx.fill();
+    }
+    ctx.restore();
+  };
+
+  // ---------- trunks ----------
+  /**
+   * A trunk standing in the wash. o: { x, top, bottom, w (width at bottom), taper (0..0.4), lean (px over height),
+   * tone, seed, T, fadeFrom (y where the wet fade starts), fadeTo (y where it is gone), edge, opaque (paint over what is behind) }
+   */
+  GW.trunk = function (ctx, o) {
+    const r = GW.rng(o.seed ?? 9), n = GW.noise((o.seed ?? 9) + 17), T = o.T;
+    const top = o.top, bot = o.bottom, H = bot - top, steps = Math.max(8, Math.round(H / 18));
+    const left = [], right = [];
+    for (let i = 0; i <= steps; i++) {
+      const v = i / steps, y = top + H * v;
+      const w = o.w * (1 - (o.taper ?? 0.12) * (1 - v)) * (1 + 0.06 * n(v * 3, 1.3));
+      const cx = o.x + (o.lean ?? 0) * (v - 0.5) + (o.wobble ?? 0.012) * H * n(v * 2.2, 7.7);
+      left.push([cx - w / 2 + 1.2 * n(v * 30, 3), y, 0.35]);
+      right.unshift([cx + w / 2 + 1.2 * n(v * 30, 5), y, 0.35]);
+    }
+    const poly = left.concat(right);
+    const fade = [];
+    if (o.fadeFrom != null) fade.push({ x0: 0, y0: o.fadeFrom, x1: 0, y1: o.fadeTo, stops: [[0, 1], [1, 0]] });
+    if (o.fadeTop != null) fade.push({ x0: 0, y0: o.fadeTop[0], x1: 0, y1: o.fadeTop[1], stops: [[0, 0], [1, 1]] });
+    const target = o.opaque ? GW.canvas(ctx.canvas.width, ctx.canvas.height) : null;
+    const res = GW.wash(target ? target.getContext('2d') : ctx, poly, {
+      T, seed: o.seed, tone: o.tone ?? 0.6, layers: o.layers ?? 22, spread: 0.004, jitter: 0.0035, depth: 4, maxLen: 40,
+      edge: o.edge ?? 0.7, edgeWidth: Math.max(3, o.w * 0.12), mottle: o.mottle ?? 0.55, blotch: o.blotch ?? 0.35, grain: o.grain ?? 0.75, streaky: true, fade, soft: o.soft ?? 0.6,
+    });
+    // bark: thin tapered vertical strokes inside the trunk, some darker, some lifted (wet light)
+    const streaks = o.streaks ?? Math.max(2, Math.round(o.w / 16));
+    const tctx = target ? target.getContext('2d') : ctx;
+    for (let k = 0; k < streaks; k++) {
+      const u = 0.12 + 0.76 * r(), y0 = top + H * (r() * 0.85 - 0.1), y1 = y0 + H * (0.08 + 0.3 * r());
+      const sw = o.w * (0.035 + 0.07 * r()), pts = [], m = 14;
+      const cxAt = (y) => { const vv = (y - top) / H; return o.x + (o.lean ?? 0) * (vv - 0.5) + (o.wobble ?? 0.012) * H * n(vv * 2.2, 7.7) + (u - 0.5) * o.w * (1 - (o.taper ?? 0.12) * (1 - vv)); };
+      for (let i = 0; i <= m; i++) { const v = i / m, y = y0 + (y1 - y0) * v, ww = sw * Math.sin(Math.PI * v); pts.push([cxAt(y) - ww / 2 + 1.5 * n(v * 4, k), y, 0.3]); }
+      for (let i = m; i >= 0; i--) { const v = i / m, y = y0 + (y1 - y0) * v, ww = sw * Math.sin(Math.PI * v); pts.push([cxAt(y) + ww / 2 + 1.5 * n(v * 4, k), y, 0.3]); }
+      const lifted = r() < 0.35;
+      tctx.save(); GW.path(tctx, poly); tctx.clip();
+      if (lifted) { tctx.globalAlpha = 0.18; tctx.filter = 'blur(3px)'; tctx.fillStyle = GW.palette.paper; GW.path(tctx, pts); tctx.fill(); }
+      else { tctx.globalCompositeOperation = 'multiply'; tctx.globalAlpha = 0.22 + 0.2 * r(); tctx.filter = 'blur(1.6px)'; tctx.fillStyle = GW.palette.pigment; GW.path(tctx, pts); tctx.fill(); }
+      tctx.restore();
+    }
+    if (target) {
+      // opaque trunk: paper under the paint, then the paint, then cut to the trunk outline
+      const out = GW.canvas(ctx.canvas.width, ctx.canvas.height), ox = out.getContext('2d');
+      ox.save(); ox.filter = 'blur(0.8px)'; ox.fillStyle = GW.palette.paper; GW.path(ox, poly); ox.fill(); ox.restore();
+      if (fade.length) for (const f of fade) {
+        const g = ox.createLinearGradient(f.x0, f.y0, f.x1, f.y1);
+        for (const [t, al] of f.stops) g.addColorStop(t, `rgba(0,0,0,${al})`);
+        ox.globalCompositeOperation = 'destination-in'; ox.fillStyle = g; ox.fillRect(0, 0, out.width, out.height);
+      }
+      ox.globalCompositeOperation = 'multiply'; ox.drawImage(target, 0, 0);
+      ox.globalCompositeOperation = 'destination-in'; ox.save(); ox.filter = 'blur(0.8px)'; GW.path(ox, poly); ox.fillStyle = '#000'; ox.fill(); ox.restore();
+      if (fade.length) for (const f of fade) {
+        const g = ox.createLinearGradient(f.x0, f.y0, f.x1, f.y1);
+        for (const [t, al] of f.stops) g.addColorStop(t, `rgba(0,0,0,${al})`);
+        ox.globalCompositeOperation = 'destination-in'; ox.fillStyle = g; ox.fillRect(0, 0, out.width, out.height);
+      }
+      ctx.drawImage(out, 0, 0);
+      return { poly, layer: out };
+    }
+    return { poly, res };
+  };
+
+  /** The cast-shadow stroke: a thin dark dash lying on the ground (tapered, slightly broken). */
+  GW.dash = function (ctx, x0, y0, x1, y1, o = {}) {
+    const r = GW.rng(o.seed ?? 4), w = o.w ?? 5, len = Math.hypot(x1 - x0, y1 - y0), nx = -(y1 - y0) / len, ny = (x1 - x0) / len;
+    const pts = [], m = 16;
+    for (let i = 0; i <= m; i++) { const t = i / m, ww = w * Math.sin(Math.PI * Math.pow(t, 0.8)) * (0.75 + 0.25 * Math.sin(t * 9 + r() * 6)); pts.push([x0 + (x1 - x0) * t + nx * ww * 0.5, y0 + (y1 - y0) * t + ny * ww * 0.5]); }
+    for (let i = m; i >= 0; i--) { const t = i / m, ww = w * Math.sin(Math.PI * Math.pow(t, 0.8)) * 0.8; pts.push([x0 + (x1 - x0) * t - nx * ww * 0.5, y0 + (y1 - y0) * t - ny * ww * 0.5]); }
+    ctx.save(); ctx.globalCompositeOperation = o.mode || 'multiply'; ctx.globalAlpha = o.alpha ?? 0.8; ctx.filter = `blur(${o.blur ?? 0.9}px)`;
+    ctx.fillStyle = GW.tone(o.tone ?? 0.8); GW.path(ctx, pts); ctx.fill(); ctx.restore();
+  };
+
+  // ---------- the gentleman (2.5D puppet) ----------
+  // Proportions as fractions of the figure height Hf (feet to hat top).
+  const BODY = {
+    ankle: 0.035, shin: 0.237, thigh: 0.237, torso: 0.285, neck: 0.072, head: 0.05,
+    shoulderDrop: 0.035, shoulderW: 0.098, hipW: 0.052, upper: 0.165, fore: 0.165,
+    legW: [0.078, 0.062], armW: [0.056, 0.046], hand: 0.021,
+    hat: { crown: 0.118, top: 0.068, bottom: 0.074, brim: 0.108, brimH: 0.013, seat: 0.022 },
+  };
+  GW.BODY = BODY;
+  const v3 = (x, y, z) => [x, y, z], add = (a, b) => [a[0] + b[0], a[1] + b[1], a[2] + b[2]], sub = (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+  const mul = (a, k) => [a[0] * k, a[1] * k, a[2] * k], dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2], len3 = (a) => Math.hypot(a[0], a[1], a[2]);
+  const norm = (a) => { const l = len3(a) || 1; return [a[0] / l, a[1] / l, a[2] / l]; };
+  /** Two-bone IK in 3D: root, target, bone lengths, pole direction → middle joint. */
+  function ik(root, target, l1, l2, pole, stretch = 1) {
+    let d = sub(target, root), dist = len3(d);
+    // animators' cheat: a limb may stretch a little instead of letting the foot float
+    if (stretch > 1 && dist > (l1 + l2) * 0.999) { const k = Math.min(stretch, dist / ((l1 + l2) * 0.999)); l1 *= k; l2 *= k; }
+    const maxd = (l1 + l2) * 0.999; if (dist > maxd) { target = add(root, mul(norm(d), maxd)); d = sub(target, root); dist = maxd; }
+    const mind = Math.abs(l1 - l2) + 1e-3; if (dist < mind) dist = mind;
+    const dn = norm(d), a = (l1 * l1 - l2 * l2 + dist * dist) / (2 * dist), h = Math.sqrt(Math.max(0, l1 * l1 - a * a));
+    let p = sub(pole, mul(dn, dot(pole, dn))); if (len3(p) < 1e-6) p = [0, -1, 0]; p = norm(p);
+    return { mid: add(add(root, mul(dn, a)), mul(p, h)), end: target };
+  }
+  GW.ik = ik;
+
+  /**
+   * Solve the puppet for a pose. P (all px, world: x right, y down, z towards the viewer):
+   *   Hf          figure height
+   *   hip         [x, y]  pelvis centre
+   *   phi         facing: 0 = right, -PI/2 = back to the viewer, -PI = left
+   *   lean        torso pitch in rad (forward +)
+   *   headPitch   extra head pitch (down +)
+   *   feet        [[x, y, z?], [x, y, z?]] ankle targets for leg A (s = -1) and leg B (s = +1);
+   *               z defaults to the hip side offset at phi
+   *   hands       [[x, y, z?], [x, y, z?]] world targets for arm A and arm B (or null → hanging)
+   *   handsLocal  [[f, u, s], …] targets in the body frame relative to the hip (used when hands is null)
+   *   coatLag     0..1 how much the coat tails trail behind (walking)
+   */
+  GW.solve = function (P) {
+    const Hf = P.Hf, B = BODY, phi = P.phi ?? 0, lean = P.lean ?? 0;
+    const F = v3(Math.cos(phi), 0, Math.sin(phi)), U = v3(0, -1, 0), S = v3(-Math.sin(phi), 0, Math.cos(phi));
+    const hip = v3(P.hip[0], P.hip[1], 0);
+    const At = add(mul(U, Math.cos(lean)), mul(F, Math.sin(lean)));   // torso axis
+    const Ft = sub(mul(F, Math.cos(lean)), mul(U, Math.sin(lean)));   // torso forward
+    const neck = add(hip, mul(At, B.torso * Hf));
+    const hl = lean + (P.headPitch ?? 0);
+    const Ah = add(mul(U, Math.cos(hl)), mul(F, Math.sin(hl))), Fh = sub(mul(F, Math.cos(hl)), mul(U, Math.sin(hl)));
+    const head = add(neck, mul(Ah, B.neck * Hf));
+    const legs = [-1, 1].map((s, i) => {
+      const root = add(hip, mul(S, s * B.hipW * Hf));
+      const ft = P.feet[i]; const tgt = v3(ft[0], ft[1], ft[2] == null ? root[2] : ft[2]);
+      const pole = add(F, mul(U, 0.05));
+      const k = ik(root, tgt, B.thigh * Hf, B.shin * Hf, pole, P.stretch ?? 1);
+      const pitch = ft[3] == null ? 0.17 : ft[3];   // foot pitch: + = toe down
+      return { s, root, knee: k.mid, ankle: k.end, toe: add(k.end, add(mul(F, 0.072 * Hf * Math.cos(pitch)), v3(0, 0.072 * Hf * Math.sin(pitch), 0))) };
+    });
+    const arms = [-1, 1].map((s, i) => {
+      const root = add(add(neck, mul(At, -B.shoulderDrop * Hf)), mul(S, s * B.shoulderW * Hf));
+      let tgt;
+      if (P.hands && P.hands[i]) { const h = P.hands[i]; tgt = v3(h[0], h[1], h[2] == null ? root[2] : h[2]); }
+      else { const l = (P.handsLocal && P.handsLocal[i]) || [0.012, -0.135, s * 0.125]; tgt = add(add(add(hip, mul(F, l[0] * Hf)), mul(U, l[1] * Hf)), mul(S, l[2] * Hf)); }
+      const pole = P.armPole ? add(add(mul(F, P.armPole[0]), mul(U, P.armPole[1])), mul(S, s * P.armPole[2])) : add(add(mul(F, -1), mul(U, -0.3)), mul(S, s * 0.25));
+      const k = ik(root, tgt, B.upper * Hf, B.fore * Hf, pole);
+      return { s, root, elbow: k.mid, hand: k.end };
+    });
+    return { P, Hf, phi, F, U, S, At, Ft, Ah, Fh, hip, neck, head, legs, arms };
+  };
+
+  function hull(pts) {
+    pts = pts.slice().sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+    const cr = (o, a, b) => (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+    const lo = [], up = [];
+    for (const p of pts) { while (lo.length >= 2 && cr(lo[lo.length - 2], lo[lo.length - 1], p) <= 0) lo.pop(); lo.push(p); }
+    for (let i = pts.length - 1; i >= 0; i--) { const p = pts[i]; while (up.length >= 2 && cr(up[up.length - 2], up[up.length - 1], p) <= 0) up.pop(); up.push(p); }
+    up.pop(); lo.pop(); return lo.concat(up);
+  }
+  GW.hull = hull;
+  /** A limb as two tapered capsules (thigh/shin, upper arm/forearm), filled with the current fillStyle. */
+  function limb(ctx, pts, w0, wm, w1, grow = 0) {
+    const seg = (a, b, wa, wb) => {
+      wa += grow; wb += grow;
+      const dx = b[0] - a[0], dy = b[1] - a[1], l = Math.hypot(dx, dy) || 1, nx = -dy / l, ny = dx / l;
+      ctx.beginPath();
+      ctx.moveTo(a[0] + nx * wa / 2, a[1] + ny * wa / 2); ctx.lineTo(b[0] + nx * wb / 2, b[1] + ny * wb / 2);
+      ctx.lineTo(b[0] - nx * wb / 2, b[1] - ny * wb / 2); ctx.lineTo(a[0] - nx * wa / 2, a[1] - ny * wa / 2); ctx.closePath(); ctx.fill();
+      ctx.beginPath(); ctx.arc(a[0], a[1], wa / 2, 0, Math.PI * 2); ctx.fill();
+      ctx.beginPath(); ctx.arc(b[0], b[1], wb / 2, 0, Math.PI * 2); ctx.fill();
+    };
+    seg(pts[0], pts[1], w0, wm); seg(pts[1], pts[2], wm * 0.96, w1);
+  }
+  const scratch = {};
+  const tmp = (name, w, h) => { let c = scratch[name]; if (!c) c = scratch[name] = GW.canvas(w, h); if (c.width !== w || c.height !== h) { c.width = w; c.height = h; } const x = c.getContext('2d'); x.setTransform(1, 0, 0, 1, 0, 0); x.globalAlpha = 1; x.globalCompositeOperation = 'source-over'; x.filter = 'none'; x.clearRect(0, 0, w, h); return [c, x]; };
+
+  /**
+   * Draw the gentleman. Paints opaque tones into an offscreen layer, adds mottling and paper grain,
+   * then composites with a slight blur so the edges sit in the paint. Returns the solved skeleton.
+   * P as in GW.solve, plus: T (textures), seed, alpha (fog), tones {coat, near, far, face, hand, hat}
+   */
+  GW.gentleman = function (ctx, P) {
+    const K = GW.solve(P), Hf = P.Hf, B = BODY;
+    const pad = Hf * 0.9, ox = Math.floor(P.hip[0] - pad), oy = Math.floor(P.hip[1] - Hf * 1.25);
+    const Wc = Math.ceil(pad * 2), Hc = Math.ceil(Hf * 2.0);
+    GW._fig = GW._fig || GW.canvas(Wc, Hc);
+    const L = GW._fig; if (L.width !== Wc || L.height !== Hc) { L.width = Wc; L.height = Hc; }
+    const x = L.getContext('2d'); x.setTransform(1, 0, 0, 1, 0, 0); x.clearRect(0, 0, Wc, Hc); x.translate(-ox, -oy);
+    const tn = Object.assign({ coat: 0.95, near: 0.93, far: 0.84, face: 0.46, hand: 0.5, hat: 0.97, collar: 0.2, beard: 0.82, shoe: 0.95 }, P.tones || {});
+    const col = (t) => GW.tone(t);
+    const zOf = (p) => p[2];
+    // legs: far first
+    const legs = K.legs.slice().sort((a, b) => zOf(a.root) - zOf(b.root));
+    const arms = K.arms.slice().sort((a, b) => zOf(a.root) - zOf(b.root));
+    // near limbs get a thin gap of paper around them, the way a painter leaves a hair of white between two dark strokes
+    const gap = (fn) => { x.save(); x.globalAlpha = 0.3; fn(GW.palette.paper, 0.011 * Hf); x.restore(); };
+    const drawLeg = (g, t, near) => {
+      const L3 = (c, grow) => { x.fillStyle = c; limb(x, [g.root, g.knee, g.ankle], 0.088 * Hf, 0.062 * Hf, 0.05 * Hf, grow); };
+      if (near) gap(L3);
+      L3(col(t), 0);
+      // shoe
+      const F = K.F, back = sub(g.ankle, mul(F, 0.022 * Hf)), toe = g.toe, sole = 0.026 * Hf;
+      x.fillStyle = col(tn.shoe); x.beginPath();
+      x.moveTo(back[0], back[1] - sole * 0.6); x.lineTo(toe[0], toe[1] - sole * 0.35); x.quadraticCurveTo(toe[0] + Math.cos(K.phi) * 0.01 * Hf, toe[1] + sole * 0.4, toe[0], toe[1] + sole * 0.45);
+      x.lineTo(back[0], back[1] + sole * 0.45); x.closePath(); x.fill();
+    };
+    const drawArm = (a, t, near) => {
+      const A3 = (c, grow) => { x.fillStyle = c; limb(x, [a.root, a.elbow, a.hand], 0.06 * Hf, 0.047 * Hf, 0.038 * Hf, grow); };
+      if (near) gap(A3);
+      A3(col(t), 0);
+      x.fillStyle = col(tn.hand); x.beginPath(); x.arc(a.hand[0], a.hand[1], B.hand * Hf, 0, Math.PI * 2); x.fill();
+    };
+    drawLeg(legs[0], tn.far, false); drawLeg(legs[1], tn.near, true);
+    const backArmBehind = Math.abs(Math.sin(K.phi)) < 0.5 && zOf(arms[0].hand) < 0.0;
+    if (backArmBehind) drawArm(arms[0], tn.far);
+    // coat: hull of consecutive cross-sections
+    const sec = (c, Ff, Ss, front, back, w, n = 14) => Array.from({ length: n }, (_, i) => {
+      const a = (i / n) * Math.PI * 2, cf = Math.cos(a), sf = Math.sin(a);
+      const f = cf >= 0 ? cf * front : cf * back;
+      return add(add(c, mul(Ff, f * Hf)), mul(Ss, sf * w * Hf));
+    });
+    const lag = P.coatLag ?? 0;
+    const hemC = add(add(K.hip, v3(0, 0.205 * Hf, 0)), mul(K.F, (-0.012 - 0.03 * lag) * Hf));
+    const C = (h) => add(K.hip, mul(K.At, h * Hf));
+    const sections = [
+      sec(C(B.torso - 0.012), K.Ft, K.S, 0.045, 0.05, 0.075),
+      sec(C(B.torso - 0.045), K.Ft, K.S, 0.07, 0.062, 0.112),
+      sec(C(0.19), K.Ft, K.S, 0.078, 0.06, 0.1),
+      sec(C(0.07), K.Ft, K.S, 0.062, 0.062, 0.088),
+      sec(K.hip, K.Ft, K.S, 0.07, 0.078, 0.092),
+      sec(hemC, K.F, K.S, 0.06, 0.105 + 0.015 * lag, 0.1),
+    ];
+    x.fillStyle = col(tn.coat);
+    for (let i = 0; i < sections.length - 1; i++) { const h = hull(sections[i].concat(sections[i + 1])); x.beginPath(); h.forEach((p, k) => (k ? x.lineTo(p[0], p[1]) : x.moveTo(p[0], p[1]))); x.closePath(); x.fill(); }
+    // collar (light shirt at the throat, only in profile)
+    const prof = Math.abs(Math.cos(K.phi));
+    if (prof > 0.2) {
+      const c0 = add(K.neck, mul(K.Ft, 0.03 * Hf)), c1 = add(c0, mul(K.At, -0.05 * Hf)), c2 = add(K.neck, mul(K.At, 0.012 * Hf));
+      x.fillStyle = col(tn.collar); x.globalAlpha = Math.min(1, (prof - 0.2) * 2);
+      x.beginPath(); x.moveTo(c2[0], c2[1]); x.lineTo(c0[0] + K.F[0] * 0.012 * Hf, c0[1]); x.lineTo(c1[0], c1[1]); x.closePath(); x.fill(); x.globalAlpha = 1;
+    }
+    // neck
+    x.strokeStyle = col(tn.face + 0.25); x.lineWidth = 0.04 * Hf; x.lineCap = 'round';
+    x.beginPath(); x.moveTo(K.neck[0], K.neck[1]); const nk = add(K.neck, mul(K.Ah, 0.045 * Hf)); x.lineTo(nk[0], nk[1]); x.stroke();
+    if (!backArmBehind) drawArm(arms[0], tn.far);
+    // head: dark hair, lighter face on the forward side
+    const hr = B.head * Hf, hc = K.head;
+    x.fillStyle = col(0.82); x.beginPath(); x.ellipse(hc[0], hc[1], hr * 0.96, hr * 1.12, -Math.atan2(K.Ah[0], -K.Ah[1]), 0, Math.PI * 2); x.fill();
+    if (prof > 0.05) {
+      const fdir = Math.sign(Math.cos(K.phi)) || 1, rot = -Math.atan2(K.Ah[0], -K.Ah[1]);
+      x.save(); x.translate(hc[0], hc[1]); x.rotate(rot);
+      x.beginPath(); x.ellipse(0, 0, hr * 0.96, hr * 1.12, 0, 0, Math.PI * 2); x.clip();
+      x.fillStyle = col(tn.face);
+      x.beginPath(); x.ellipse(fdir * hr * 0.55 * prof, hr * 0.12, hr * 0.62 * prof, hr * 1.0, 0, 0, Math.PI * 2); x.fill();
+      // a dark beard on the jaw keeps it 19th century (soft, no smile)
+      x.fillStyle = col(tn.beard); x.beginPath(); x.ellipse(fdir * hr * 0.35 * prof, hr * 0.85, hr * 0.7 * prof, hr * 0.45, 0, 0, Math.PI * 2); x.fill();
+      x.restore();
+      // nose just outside the head outline
+      x.save(); x.translate(hc[0], hc[1]); x.rotate(rot); x.fillStyle = col(tn.face);
+      x.beginPath(); x.moveTo(fdir * hr * 0.88 * prof, -hr * 0.15); x.lineTo(fdir * hr * 1.18 * prof, hr * 0.25); x.lineTo(fdir * hr * 0.88 * prof, hr * 0.33); x.closePath(); x.fill();
+      x.restore();
+    }
+    // hat
+    const H = B.hat, seat = add(hc, mul(K.Ah, (B.head * 0.55) * Hf));
+    const rot = -Math.atan2(K.Ah[0], -K.Ah[1]);
+    x.save(); x.translate(seat[0], seat[1]); x.rotate(rot); x.fillStyle = col(tn.hat);
+    const bw = H.brim * Hf * (0.72 + 0.28 * prof), cw0 = H.bottom * Hf * (0.85 + 0.15 * prof), cw1 = H.top * Hf * (0.85 + 0.15 * prof), ch = H.crown * Hf;
+    x.beginPath(); x.ellipse(0, 0, bw / 2, H.brimH * Hf * 0.9, 0, 0, Math.PI * 2); x.fill();
+    x.beginPath(); x.moveTo(-cw0 / 2, 0); x.lineTo(-cw1 / 2 - 0.004 * Hf, -ch); x.quadraticCurveTo(0, -ch - 0.008 * Hf, cw1 / 2 + 0.004 * Hf, -ch); x.lineTo(cw0 / 2, 0); x.closePath(); x.fill();
+    // hat band (slightly lighter)
+    x.fillStyle = col(tn.hat - 0.12); x.fillRect(-cw0 / 2 + 0.5, -0.026 * Hf, cw0 - 1, 0.012 * Hf);
+    x.restore();
+    // near arm on top
+    drawArm(arms[1], tn.near, true);
+    x.setTransform(1, 0, 0, 1, 0, 0);
+    // watercolour treatment: the figure is painted, not cut out
+    if (P.T) {
+      const T = P.T;
+      // pigment pooled at the drying edge
+      const [B1, b1] = tmp('fB', Wc, Hc); b1.filter = `blur(${0.012 * Hf}px)`; b1.drawImage(L, 0, 0); b1.filter = 'none';
+      const [R1, r1] = tmp('fR', Wc, Hc); r1.drawImage(L, 0, 0); r1.globalCompositeOperation = 'destination-out'; r1.drawImage(B1, 0, 0);
+      r1.globalCompositeOperation = 'source-in'; r1.fillStyle = GW.palette.ink; r1.fillRect(0, 0, Wc, Hc);
+      x.globalCompositeOperation = 'source-atop'; x.globalAlpha = 0.7; x.drawImage(R1, 0, 0);
+      // wet light inside the dark (lifted blotches), granulation
+      x.globalAlpha = P.lift ?? 0.12; GW.tile(x, GW._paperTex(T), 211 + (P.seed ?? 0) * 37, 97, Wc, Hc);
+      x.globalAlpha = 1;
+      x.globalCompositeOperation = 'destination-out'; x.globalAlpha = 0.14; GW.tile(x, GW._inverse(T.grain), ox, oy, Wc, Hc); x.globalAlpha = 1;
+      x.globalCompositeOperation = 'source-over';
+    }
+    // rim light: paper brought back on the edge that faces the light
+    if ((P.rim ?? 0) > 0.01) {
+      const d = 0.012 * Hf, dir = P.rimDir ?? 1;
+      const [R2, r2] = tmp('fL', Wc, Hc); r2.drawImage(L, 0, 0); r2.globalCompositeOperation = 'destination-out'; r2.drawImage(L, -dir * d, d * 0.3);
+      r2.globalCompositeOperation = 'source-in'; r2.fillStyle = GW.palette.paper; r2.fillRect(0, 0, Wc, Hc);
+      x.globalCompositeOperation = 'source-atop'; x.globalAlpha = P.rim; x.filter = 'blur(0.6px)'; x.drawImage(R2, 0, 0); x.filter = 'none'; x.globalAlpha = 1; x.globalCompositeOperation = 'source-over';
+    }
+    ctx.save();
+    // a faint bleed into the damp paper around him
+    ctx.globalAlpha = (P.alpha ?? 1) * 0.16; ctx.globalCompositeOperation = 'multiply'; ctx.filter = `blur(${0.02 * Hf}px)`; ctx.drawImage(L, ox, oy);
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.globalAlpha = P.alpha ?? 1; ctx.filter = `blur(${P.blur ?? 0.6}px)`; ctx.drawImage(L, ox, oy); ctx.restore();
+    return K;
+  };
+  /** Paper-coloured version of the mottle texture: used to lift light into dark shapes. */
+  GW._paperTex = function (T) {
+    if (T.__paper) return T.__paper;
+    const c = GW.canvas(T.w, T.h), x = c.getContext('2d');
+    x.drawImage(GW._inverse(T.mottle), 0, 0); x.globalCompositeOperation = 'source-in'; x.fillStyle = GW.palette.paper; x.fillRect(0, 0, T.w, T.h);
+    return (T.__paper = c);
+  };
+
+  // ---------- the stone ----------
+  /** Pre-render a boulder texture (unrotated) of radius R. Returns { canvas, R, poly } centred in the canvas. */
+  GW.stoneTexture = function (R, seed, T) {
+    const r = GW.rng(seed), n = GW.noise(seed + 5), pad = Math.ceil(R * 0.35), S = Math.ceil(2 * R + 2 * pad);
+    const c = GW.canvas(S, S), x = c.getContext('2d'), cx = S / 2, cy = S / 2;
+    const poly = Array.from({ length: 120 }, (_, i) => { const a = (i / 120) * Math.PI * 2, k = 1 + 0.07 * n(Math.cos(a) * 0.9, Math.sin(a) * 0.9) + 0.02 * n(Math.cos(a) * 3.5, Math.sin(a) * 3.5 + 3); return [cx + Math.cos(a) * R * k, cy + Math.sin(a) * R * k, 0.25]; });
+    // base wash (into the texture as an opaque painted object)
+    x.fillStyle = GW.palette.paper; GW.path(x, poly); x.fill();
+    const tex = T;
+    GW.wash(x, poly, { T: tex, seed, tone: 0.95, layers: 20, spread: 0.008, jitter: 0.01, maxLen: 20, edge: 0.7, edgeWidth: R * 0.1, mottle: 0.5, blotch: 0.6, grain: 1 });
+    // darker blotches and cracks that turn with the stone
+    for (let k = 0; k < 3; k++) {
+      const a = r() * Math.PI * 2, d = R * (0.2 + 0.5 * r()), bx = cx + Math.cos(a) * d, by = cy + Math.sin(a) * d;
+      GW.wash(x, GW.circlePoly(bx, by, R * (0.12 + 0.18 * r()), R * (0.08 + 0.12 * r()), 10), { T: tex, seed: seed * 7 + k, tone: 0.16, layers: 10, spread: 0.22, jitter: 0.1, edge: 0.8, edgeWidth: 2, mottle: 0.6, soft: 1.5, clip: poly });
+    }
+    x.save(); GW.path(x, poly); x.clip();
+    x.strokeStyle = GW.tone(0.95); x.lineCap = 'round'; x.filter = 'blur(0.6px)';
+    for (let k = 0; k < 3; k++) {
+      const a = r() * Math.PI * 2; let px = cx + Math.cos(a) * R * 0.95, py = cy + Math.sin(a) * R * 0.95, dir = a + Math.PI + (r() - 0.5) * 0.9;
+      x.lineWidth = 1 + r() * 1.2; x.globalAlpha = 0.3 + 0.25 * r(); x.beginPath(); x.moveTo(px, py);
+      const steps = 4 + Math.floor(r() * 4);
+      for (let s = 0; s < steps; s++) { dir += (r() - 0.5) * 0.9; px += Math.cos(dir) * R * 0.14; py += Math.sin(dir) * R * 0.14; x.lineTo(px, py); }
+      x.stroke();
+    }
+    x.restore();
+    return { canvas: c, R, poly, cx, cy };
+  };
+  /** How far the stone's centre sits from the ground along the normal (nx, ny pointing out of the ground) at rotation angle. */
+  GW.stoneSupport = function (st, angle, nx, ny) {
+    const ca = Math.cos(angle), sa = Math.sin(angle); let m = 0;
+    for (const p of st.poly) { const dx = p[0] - st.cx, dy = p[1] - st.cy, rx = dx * ca - dy * sa, ry = dx * sa + dy * ca; m = Math.max(m, -(rx * nx + ry * ny)); }
+    return m;
+  };
+  /** Draw the stone at (x, y) with rotation angle; light comes from o.light (radians, default from the upper right). */
+  GW.stone = function (ctx, st, x, y, angle, o = {}) {
+    const S = st.canvas.width;
+    GW._stoneL = GW._stoneL || GW.canvas(S, S);
+    const L = GW._stoneL; if (L.width !== S) { L.width = S; L.height = S; }
+    const c = L.getContext('2d'); c.setTransform(1, 0, 0, 1, 0, 0); c.clearRect(0, 0, S, S);
+    c.translate(S / 2, S / 2); c.rotate(angle); c.drawImage(st.canvas, -S / 2, -S / 2); c.setTransform(1, 0, 0, 1, 0, 0);
+    // fixed shading (does not turn): light upper right, core shadow lower left
+    const la = o.light ?? -Math.PI / 4, R = st.R;
+    c.globalCompositeOperation = 'source-atop';
+    const g = c.createRadialGradient(S / 2 + Math.cos(la) * R * 0.55, S / 2 + Math.sin(la) * R * 0.55, R * 0.05, S / 2, S / 2, R * 1.15);
+    g.addColorStop(0, GW.paperRGBA(0.34)); g.addColorStop(0.4, GW.paperRGBA(0.06)); g.addColorStop(0.68, 'rgba(28,29,31,0.18)'); g.addColorStop(1, 'rgba(28,29,31,0.62)');
+    c.fillStyle = g; c.fillRect(0, 0, S, S);
+    c.globalCompositeOperation = 'source-over';
+    ctx.save(); ctx.globalAlpha = o.alpha ?? 1; ctx.filter = `blur(${o.blur ?? 0.5}px)`; ctx.drawImage(L, x - S / 2, y - S / 2); ctx.restore();
+  };
+
+  // ---------- birds ----------
+  /** list: [{x, y, s (span px), phase}], t in s. A bird is two curved strokes that beat about 3 times a second. */
+  GW.birds = function (ctx, list, t, o = {}) {
+    ctx.save(); ctx.strokeStyle = GW.tone(o.tone ?? 0.7); ctx.lineCap = 'round'; ctx.filter = 'blur(0.4px)';
+    for (const b of list) {
+      const beat = Math.sin((t * (b.rate ?? 3.1) + (b.phase ?? 0)) * Math.PI * 2), s = b.s, lift = s * (0.12 + 0.28 * beat);
+      ctx.globalAlpha = b.alpha ?? 1; ctx.lineWidth = Math.max(1, s * 0.11);
+      ctx.beginPath(); ctx.moveTo(b.x - s / 2, b.y - lift); ctx.quadraticCurveTo(b.x - s * 0.2, b.y - lift * 0.2 - s * 0.08, b.x, b.y);
+      ctx.quadraticCurveTo(b.x + s * 0.2, b.y - lift * 0.2 - s * 0.08, b.x + s / 2, b.y - lift); ctx.stroke();
+    }
+    ctx.restore();
+  };
+
+  G.GW = GW;
+  if (typeof module !== 'undefined') module.exports = GW;
+})(typeof window !== 'undefined' ? window : globalThis);
+
+/* sisyphus-plan.js — geometry, timeline and motion for the loop "Sisyphus" (Grisaille Wash).
+ * Pure math, no canvas: the page (sisyphus.html) draws from it, the sound score (sisyphus-sound.js) listens to it.
+ *
+ * The story, 16 s, seamless:
+ *   0.0– 6.6  he pushes the stone up the slope (out of the fog at the bottom)
+ *   6.6– 7.1  the stone rests on the crest; he lets go and straightens
+ *   7.05–9.4  he walks past the stone (behind it) to the edge and brings his feet together
+ *   9.05–9.35 the stone wobbles … and rolls back down into the fog
+ *   9.4–10.8  he turns and watches it go, then turns back to the open side
+ *  10.8–12.4  the pause: the fog lifts, light, birds. Hands behind his back.
+ *  12.4–16.0  he turns and walks down, calmly, hands behind his back, into the fog — and comes out pushing.
+ *
+ * Everything is a function of t. All times in seconds, all lengths in px on a 1920 x 1080 frame.
+ */
+(function (G) {
+  'use strict';
+
+  const W = 1920, H = 1080, DUR = 16, FPS = 24;
+  const Hf = 170;                 // figure height (feet to hat top)
+  const R = 62;                   // stone radius
+  const ANKLE = 0.035 * Hf, LEG = 0.474 * Hf;
+
+  // ---------- timeline ----------
+  const TL = {
+    push: [0, 6.6], release: [6.6, 7.05], pass: [7.05, 8.95], close: 0.42,
+    wobble: [9.05, 9.35], roll: 9.35,
+    turn1: [9.4, 9.8], turn2: [10.4, 10.8], pause: [10.8, 12.4], turn3: [12.4, 12.8],
+    descent: [12.8, 16.0],
+    seamFog: { rise: [14.2, 15.4], fall: [0.35, 1.9] },
+    vistaFog: { open: [10.1, 11.9], close: [12.9, 14.8] },
+    birds: [10.1, 14.1],
+  };
+
+  // ---------- the hill (monotone cubic through the contour points) ----------
+  const CONTOUR = [
+    [-80, 1000], [120, 925], [300, 842], [450, 762], [580, 692], [700, 632], [820, 576], [915, 535],
+    [985, 502], [1030, 485], [1070, 477], [1105, 476], [1128, 479], [1141, 488], [1151, 506], [1157, 530],
+    [1168, 546], [1177, 590], [1188, 606], [1196, 652], [1211, 700], [1223, 760], [1247, 800], [1263, 862],
+    [1300, 920], [1360, 980], [1440, 1060], [1500, 1100],
+  ];
+  function monotone(pts) {
+    const n = pts.length, xs = pts.map((p) => p[0]), ys = pts.map((p) => p[1]);
+    const d = [], m = new Array(n);
+    for (let i = 0; i < n - 1; i++) d.push((ys[i + 1] - ys[i]) / (xs[i + 1] - xs[i]));
+    m[0] = d[0]; m[n - 1] = d[n - 2];
+    for (let i = 1; i < n - 1; i++) m[i] = d[i - 1] * d[i] <= 0 ? 0 : (d[i - 1] + d[i]) / 2;
+    for (let i = 0; i < n - 1; i++) {
+      if (d[i] === 0) { m[i] = m[i + 1] = 0; continue; }
+      const a = m[i] / d[i], b = m[i + 1] / d[i], h = a * a + b * b;
+      if (h > 9) { const t = 3 / Math.sqrt(h); m[i] = t * a * d[i]; m[i + 1] = t * b * d[i]; }
+    }
+    return (x) => {
+      if (x <= xs[0]) return ys[0] + m[0] * (x - xs[0]);
+      if (x >= xs[n - 1]) return ys[n - 1] + m[n - 1] * (x - xs[n - 1]);
+      let i = 0; while (x > xs[i + 1]) i++;
+      const hh = xs[i + 1] - xs[i], t = (x - xs[i]) / hh, t2 = t * t, t3 = t2 * t;
+      return (2 * t3 - 3 * t2 + 1) * ys[i] + (t3 - 2 * t2 + t) * hh * m[i] + (-2 * t3 + 3 * t2) * ys[i + 1] + (t3 - t2) * hh * m[i + 1];
+    };
+  }
+  const groundY = monotone(CONTOUR);
+  // arc length table along the walkable part
+  const X0 = -80, X1 = 1180, STEP = 1;
+  const sTab = [0];
+  for (let x = X0 + STEP; x <= X1; x += STEP) sTab.push(sTab[sTab.length - 1] + Math.hypot(STEP, groundY(x) - groundY(x - STEP)));
+  const sOf = (x) => { const i = (x - X0) / STEP, k = Math.max(0, Math.min(sTab.length - 2, Math.floor(i))), f = i - k; return sTab[k] + (sTab[k + 1] - sTab[k]) * f; };
+  const xOf = (s) => {
+    let lo = 0, hi = sTab.length - 1;
+    if (s <= 0) return X0 + s; if (s >= sTab[hi]) return X0 + hi * STEP + (s - sTab[hi]);
+    while (hi - lo > 1) { const mid = (lo + hi) >> 1; if (sTab[mid] < s) lo = mid; else hi = mid; }
+    return X0 + (lo + (s - sTab[lo]) / (sTab[hi] - sTab[lo])) * STEP;
+  };
+  const slope = (x) => (groundY(x + 1) - groundY(x - 1)) / 2;
+  const normal = (x) => { const k = slope(x), l = Math.hypot(1, k); return [k / l, -1 / l]; };   // pointing up/out of the ground
+
+  // ---------- easing ----------
+  const clamp = (v, a = 0, b = 1) => (v < a ? a : v > b ? b : v);
+  const P = (t, a, b) => clamp((t - a) / (b - a));
+  const smooth = (t) => t * t * (3 - 2 * t);
+  const ioSin = (t) => 0.5 - 0.5 * Math.cos(Math.PI * clamp(t));
+  const lerp = (a, b, t) => a + (b - a) * t;
+  /** cumulative profile from a velocity function v(τ) on 0..1, normalised to end at 1 */
+  function profile(v, n = 2000) {
+    const c = new Float64Array(n + 1);
+    for (let i = 1; i <= n; i++) c[i] = c[i - 1] + (v((i - 0.5) / n)) / n;
+    const tot = c[n];
+    return (t) => { t = clamp(t); const i = t * n, k = Math.min(n - 1, Math.floor(i)); return (c[k] + (c[k + 1] - c[k]) * (i - k)) / tot; };
+  }
+
+  // ---------- key positions ----------
+  const STONE_X0 = 712, STONE_X1 = 1040;            // push: stone centre x at start (in the fog) and on the crest
+  const OFF = 182;                                   // arc distance hip → stone centre while pushing
+  const LEAD = 0.13 * Hf;                            // while pushing the hip is ahead of the feet (he leans into the stone)
+  const EDGE_X = 1088;                               // where he stands to look out (after closing his feet)
+  const END_X = 722;                                 // where the descent has taken him at t = 16 (inside the fog)
+  const CLOSE = 0.16 * Hf;                           // distance between the feet when standing
+  const STRETCH = 1.07;                              // legs may stretch this much (hidden by the coat)
+  const sStone0 = sOf(STONE_X0), sStone1 = sOf(STONE_X1);
+  const sHip0 = sStone0 - OFF - LEAD, sHip1 = sStone1 - OFF - LEAD, sEdge = sOf(EDGE_X), sEnd = sOf(END_X);
+
+  // segments of walking. L = step length (one step), n = steps.
+  const N_PUSH = 7, N_PASS = 4, N_DESC = 7;
+  const segs = [
+    { name: 'push', t0: TL.push[0], t1: TL.push[1], s0: sHip0, s1: sHip1, n: N_PUSH, lift: 0.035, // heavy, surging
+      w: profile((u) => (u < 0.86 ? 1 : 0.5 + 0.5 * Math.cos(Math.PI * (u - 0.86) / 0.14)) * (1 - 0.55 * Math.cos(2 * Math.PI * N_PUSH * u))) },
+    { name: 'pass', t0: TL.pass[0], t1: TL.pass[1], s0: sHip1, s1: sEdge, n: N_PASS, lift: 0.05, close: true,
+      w: profile((u) => Math.sin(Math.PI * clamp(u / 0.25) / 2) * (u > 0.75 ? Math.cos(Math.PI / 2 * (u - 0.75) / 0.25) : 1) + 1e-4) },
+    { name: 'descent', t0: TL.descent[0], t1: TL.descent[1], s0: sEdge, s1: sEnd, n: N_DESC, lift: 0.04, duty: 0.52,   // downhill: short steps, the back foot leaves early
+      w: profile((u) => Math.sin(Math.PI * clamp(u / 0.16) / 2) + 1e-4) },
+  ];
+  for (const g of segs) { g.dir = Math.sign(g.s1 - g.s0); g.L = Math.abs(g.s1 - g.s0) / g.n; }
+
+  // foot positions (in s) for a segment at hip progress u (in steps)
+  function gaitFoot(g, u, o, u0, res = 0) {
+    const d = g.duty ?? 0.6;                       // share of the cycle a foot stays on the ground
+    const up = u - o, m = Math.floor(up / 2), ph = (up - 2 * m) / 2, m0 = Math.floor((u0 - o) / 2);
+    const plant = (mm) => g.s0 + g.dir * (2 * mm + o - u0 + d) * g.L + (mm === m0 ? res : 0);
+    if (ph < d) return { s: plant(m), lift: 0, stance: true };
+    const w = smooth((ph - d) / (1 - d));
+    return { s: lerp(plant(m), plant(m + 1), w), lift: Math.sin(Math.PI * w) * g.lift * Hf, stance: false, w, to: plant(m + 1) };
+  }
+  // choose u0 per segment so the leading foot matches the previous segment's end, and remember residuals
+  (function chain() {
+    let prev = null, prevHip = null;
+    for (const g of segs) {
+      if (prevHip != null && g.name !== 'pass') { g.s0 = prevHip; g.dir = Math.sign(g.s1 - g.s0); g.L = Math.abs(g.s1 - g.s0) / g.n; }
+      if (g.name === 'pass') { g.s0 = sHip1; g.dir = 1; g.L = Math.abs(g.s1 - g.s0) / g.n; }
+      const cand = [0.1, 1.1].map((u0) => {
+        const a = gaitFoot(g, u0, 0, u0).s, b = gaitFoot(g, u0, 1, u0).s;
+        const err = prev ? Math.abs(a - prev[0]) + Math.abs(b - prev[1]) : 0;
+        return { u0, a, b, err };
+      }).sort((p, q) => p.err - q.err)[0];
+      g.u0 = cand.u0; g.res = prev ? [prev[0] - cand.a, prev[1] - cand.b] : [0, 0];
+      const ue = g.n + g.u0;
+      prev = [gaitFoot(g, ue, 0, g.u0, g.res[0]).s, gaitFoot(g, ue, 1, g.u0, g.res[1]).s];
+      prevHip = g.s1;
+      g.endFeet = prev.slice();
+      if (g.close) {
+        // the trailing foot closes up to the leading one; the hip settles between them
+        const lead = g.dir > 0 ? Math.max(prev[0], prev[1]) : Math.min(prev[0], prev[1]);
+        const trailIdx = prev[0] === lead ? 1 : 0;
+        g.closeFrom = prev.slice(); g.trail = trailIdx;
+        prev[trailIdx] = lead - g.dir * CLOSE;
+        g.closeHip = lead - g.dir * CLOSE / 2;
+        prevHip = g.closeHip;
+        g.endFeet = prev.slice();
+        // he then turns three times on the spot (pivoting): an odd number of half turns mirrors the feet
+        prev = prev.map((v) => 2 * g.closeHip - v);
+      }
+    }
+  })();
+  // the push starts in the fog: no residual at t = 0
+  segs[0].res = [0, 0];
+
+  function segAt(t) { for (const g of segs) if (t >= g.t0 && t <= g.t1) return g; return null; }
+  function lastSegBefore(t) { let r = null; for (const g of segs) if (g.t1 <= t) r = g; return r; }
+
+  /** hip arc position and both feet {s, lift} at time t */
+  function legsAt(t) {
+    const g = segAt(t);
+    if (g) {
+      const tau = (t - g.t0) / (g.t1 - g.t0), u = g.u0 + g.n * g.w(tau);
+      const hipS = g.s0 + g.dir * (u - g.u0) * g.L;
+      // the first planted position of each foot carries the residual from the last stance, so feet never slide
+      const fa = gaitFoot(g, u, 0, g.u0, g.res[0]), fb = gaitFoot(g, u, 1, g.u0, g.res[1]);
+      return { seg: g, u, hipS, feet: [fa, fb], phase: u - g.u0 };
+    }
+    const p = lastSegBefore(t);
+    if (p.close) {
+      const k = clamp((t - p.t1) / TL.close), w = smooth(k);
+      const feet = p.closeFrom.map((s0, i) => ({ s: i === p.trail ? lerp(s0, p.endFeet[i], w) : s0, lift: i === p.trail ? Math.sin(Math.PI * k) * 0.03 * Hf : 0, stance: i !== p.trail || k >= 1 }));
+      return { seg: null, u: 0, hipS: lerp(p.s1, p.closeHip, w), feet, phase: 0 };
+    }
+    return { seg: null, u: 0, hipS: p.s1, feet: [{ s: p.endFeet[0], lift: 0, stance: true }, { s: p.endFeet[1], lift: 0, stance: true }], phase: 0 };
+  }
+
+  // ---------- facing, lean, head ----------
+  function phiAt(t) {
+    const turn = (a, b, t0, t1) => lerp(a, b, ioSin(P(t, t0, t1)));
+    if (t < TL.turn1[0]) return 0;
+    if (t < TL.turn1[1]) return turn(0, -Math.PI, ...TL.turn1);
+    if (t < TL.turn2[0]) return -Math.PI;
+    if (t < TL.turn2[1]) return turn(-Math.PI, 0, ...TL.turn2);
+    if (t < TL.turn3[0]) return 0;
+    if (t < TL.turn3[1]) return turn(0, -Math.PI, ...TL.turn3);
+    return -Math.PI;
+  }
+  function leanAt(t, phase) {
+    if (t < TL.push[1]) return 0.84 + 0.05 * Math.sin(2 * Math.PI * phase - 0.6);
+    if (t < TL.release[1]) { const p = P(t, ...TL.release); return p < 0.55 ? lerp(0.84, -0.1, ioSin(p / 0.55)) : lerp(-0.1, 0.03, ioSin((p - 0.55) / 0.45)); }
+    if (t < TL.pass[1]) return lerp(0.03, 0.09, Math.sin(Math.PI * P(t, ...TL.pass)));
+    if (t < TL.descent[0]) return 0.02;
+    return lerp(0.02, -0.03, P(t, TL.descent[0], TL.descent[0] + 0.5));
+  }
+  function headAt(t) {
+    // + looks down, − looks up
+    if (t < TL.push[1]) return -0.5;                                    // head up against the stone
+    if (t < TL.release[1]) return lerp(-0.5, -0.1, P(t, ...TL.release));
+    if (t < TL.turn1[0]) return -0.05;
+    if (t < TL.turn2[0]) return lerp(-0.05, 0.32, ioSin(P(t, TL.turn1[0], TL.turn1[1] + 0.3))) * (1 - 0.3 * P(t, 9.6, 10.2)); // watching it go down
+    if (t < TL.pause[0]) return lerp(0.22, -0.05, ioSin(P(t, ...TL.turn2)));
+    if (t < TL.turn3[0]) return lerp(-0.05, -0.16, ioSin(P(t, TL.pause[0], TL.pause[0] + 0.9)));   // looks up into the light
+    if (t < TL.descent[0]) return lerp(-0.16, 0.08, ioSin(P(t, ...TL.turn3)));
+    return 0.08;
+  }
+
+  // ---------- turning on the spot: feet pivot with the body, so the legs never cross ----------
+  const TURNS = [TL.turn1, TL.turn2, TL.turn3];
+  function turnsDone(t) { return TURNS.filter((w) => t >= w[1]).length; }
+  /** feet x (and z) while standing; during a turn they rotate about the hip with the body */
+  function standingFeet(t, hipX, feetX) {
+    const odd = turnsDone(t) % 2 === 1;
+    let fx = feetX.slice();
+    if (odd) fx = fx.map((x) => 2 * hipX - x);
+    const w = TURNS.find((w) => t >= w[0] && t < w[1]);
+    if (!w) return { x: fx, z: [null, null], lift: [0, 0] };
+    const phi0 = phiAt(w[0]), phi = phiAt(t), c0 = Math.cos(phi0);
+    const side = [-0.05 * Hf, 0.05 * Hf];
+    const x = fx.map((xx, i) => hipX + (xx - hipX) * c0 * Math.cos(phi) - side[i] * Math.sin(phi));
+    const z = fx.map((xx, i) => (xx - hipX) * c0 * Math.sin(phi) + side[i] * Math.cos(phi));
+    const p = P(t, w[0], w[1]);
+    const lift = [Math.max(0, Math.sin(Math.PI * clamp(p * 2))) * 0.02 * Hf, Math.max(0, Math.sin(Math.PI * clamp(p * 2 - 1))) * 0.02 * Hf];
+    return { x, z, lift };
+  }
+
+  // ---------- stone ----------
+  const ROLL_A = 430;                    // px/s² down the slope after tipping
+  function stoneAt(t, hipS) {
+    let s, angle, visible = true, hop = 0, wob = 0;
+    if (t < TL.push[1]) { s = hipS + LEAD + OFF; angle = (s - sStone0) / R; }
+    else if (t < TL.roll) {
+      s = sStone1; angle = (sStone1 - sStone0) / R;
+      const p = P(t, ...TL.wobble);
+      if (p > 0) { wob = Math.sin(p * Math.PI * 3) * 0.03 * p; angle += wob; }
+    } else {
+      const tau = t - TL.roll, ease = Math.min(tau, 0.35);
+      // slow tip over the flat crest, then gravity
+      const d = 0.5 * ROLL_A * (tau * tau - (ease * ease) * 0.55);
+      s = sStone1 - Math.max(0, d);
+      angle = (s - sStone0) / R;
+      const v = ROLL_A * tau;
+      hop = Math.min(7, v * 0.008) * Math.pow(Math.abs(Math.sin(s / 38)), 3);
+      if (xOf(s) < 120) visible = false;
+    }
+    const x = xOf(s), gy = groundY(x), nrm = normal(x);
+    // swallowed by the lower world: gone before it reaches the far left
+    const alpha = t >= TL.roll ? smooth(clamp((x - 430) / 300)) : 1;
+    if (alpha <= 0.002) visible = false;
+    return { s, x: x + nrm[0] * R, y: gy + nrm[1] * R - hop, angle, visible, alpha, gx: x, gy };
+  }
+
+  // ---------- hands ----------
+  // hand targets in the body frame relative to the hip: [forward, up, side] in units of Hf
+  const BEHIND = [[-0.088, -0.045, -0.02], [-0.088, -0.045, 0.02]];
+  const HANG = [[0.012, -0.135, -0.125], [0.012, -0.135, 0.125]];
+  function swing(phase, amp) { const a = Math.sin(Math.PI * phase) * amp; return [[0.01 + a, -0.13, -0.125], [0.01 - a, -0.13, 0.125]]; }
+  const mixL = (A, B, k) => A.map((a, i) => a.map((v, j) => lerp(v, B[i][j], k)));
+
+  /** hip and feet before smoothing: soft = comfortable hip height (anticipates the swing foot), hard = lowest legal */
+  function frame(t) {
+    const lg = legsAt(t);
+    const lead = t < TL.push[1] ? LEAD : t < TL.release[1] ? LEAD * (1 - ioSin(P(t, TL.release[0], TL.release[1]))) : 0;
+    const hipX = xOf(lg.hipS + lead);
+    let feet = lg.feet.map((f) => { const x = xOf(f.s); return [x, groundY(x) - ANKLE - f.lift]; });
+    if (!lg.seg && t > TL.pass[1]) {
+      const sf = standingFeet(t, hipX, feet.map((f) => f[0]));
+      feet = sf.x.map((x, i) => [x, groundY(x) - ANKLE - sf.lift[i] - lg.feet[i].lift, sf.z[i]]);
+    }
+    const pushing = t < TL.push[1], relK = P(t, ...TL.release);
+    let nominal = (pushing ? 0.86 : lerp(0.86, 0.95, relK)) * LEG;
+    if (t >= TL.release[1]) nominal = 0.95 * LEG;
+    const downhill = lg.seg && lg.seg.name === 'descent';
+    if (downhill) nominal = 0.93 * LEG;
+    const reach = (fx, fy, k) => { const dx = fx - hipX, maxd = k * LEG; return fy - Math.sqrt(Math.max(0, maxd * maxd - dx * dx)); };
+    let soft = groundY(hipX) - ANKLE - nominal, hard = -1e9;
+    for (let i = 0; i < 2; i++) {
+      const f = lg.feet[i];
+      if (f.lift <= 0.5) { if (!downhill) soft = Math.max(soft, reach(feet[i][0], feet[i][1], 0.95)); hard = Math.max(hard, reach(feet[i][0], feet[i][1], STRETCH)); }
+      else if (f.to != null && lg.seg && !downhill) {
+        // the swing foot will land half a step ahead of the hip: prepare the hip height for that, gradually
+        const x = xOf(f.to), y = groundY(x) - ANKLE, dx = Math.min(Math.abs(x - hipX), 0.55 * lg.seg.L), maxd = 0.95 * LEG;
+        soft = Math.max(soft, lerp(soft, y - Math.sqrt(Math.max(0, maxd * maxd - dx * dx)), smooth(f.w)));
+      }
+    }
+    return { lg, hipX, feet, soft, hard };
+  }
+
+  /** full pose for GW.gentleman + stone + extras at time t */
+  function at(t) {
+    t = ((t % DUR) + DUR) % DUR;
+    const F = frame(t), lg = F.lg, hipX = F.hipX, feet = F.feet;
+    const phi = phiAt(t), lean = leanAt(t, lg.phase);
+    const pushing = t < TL.push[1];
+    // hip height: smoothed over ±0.14 s so landings downhill never jolt; never higher than the planted legs allow
+    let acc = 0, wsum = 0;
+    for (let k = -4; k <= 4; k++) { const tt = clamp(t + k * 0.035, 0, DUR - 1e-4), w = 1 - Math.abs(k) / 5; acc += frame(tt).soft * w; wsum += w; }
+    const hipY = Math.max(acc / wsum, F.hard);
+    // feet follow the ground; a compressed foot behind the hip rolls onto its toes (heel lifts) instead of kneeling
+    const fx = Math.cos(phi) >= 0 ? 1 : -1, FOOT = 0.072 * Hf;
+    feet.forEach((f, i) => {
+      const k = slope(f[0]) * fx, pitch = Math.atan(k);
+      const planted = groundY(f[0]) - ANKLE - f[1] < 0.5;
+      const behind = (f[0] - hipX) * fx < 0, ratio = Math.hypot(f[0] - hipX, f[1] - hipY) / LEG;
+      const lift = planted && behind ? clamp((0.86 - ratio) / 0.22) * 0.85 : planted ? 0 : 0.25;
+      if (lift > 0 && planted) {
+        // pivot about the toe, which stays on the ground
+        const tx = f[0] + fx * FOOT * Math.cos(pitch), ty = f[1] + FOOT * Math.sin(pitch);
+        const a = pitch + lift; f[0] = tx - fx * FOOT * Math.cos(a); f[1] = ty - FOOT * Math.sin(a);
+      }
+      f[3] = pitch + lift;
+    });
+    const stone = stoneAt(t, lg.hipS);
+    // hands
+    let hands = null, handsLocal = HANG;
+    if (pushing || t < TL.release[1]) {
+      const sh = [hipX + Math.sin(lean) * 0.25 * Hf, hipY - Math.cos(lean) * 0.25 * Hf];
+      // (hands meet the stone on the line to the shoulder)
+      const d = [sh[0] - stone.x, sh[1] - stone.y], l = Math.hypot(d[0], d[1]);
+      const c = [stone.x + d[0] / l * R * 0.97, stone.y + d[1] / l * R * 0.97];
+      const onStone = [[c[0], c[1] - 0.012 * Hf], [c[0] - 2, c[1] + 0.02 * Hf]];
+      if (pushing) hands = onStone;
+      else {
+        // let go: hands slide off the stone and drop to the sides
+        const k = ioSin(P(t, TL.release[0], TL.release[0] + 0.32));
+        const hang = [[hipX + 0.012 * Hf, hipY + 0.135 * Hf], [hipX + 0.012 * Hf, hipY + 0.135 * Hf]];
+        hands = onStone.map((h, i) => [lerp(h[0], hang[i][0], k), lerp(h[1], hang[i][1], k)]);
+        if (k >= 1) hands = null;
+      }
+    } else if (t < TL.pass[1]) {
+      handsLocal = mixL(HANG, swing(lg.phase, 0.07), Math.sin(Math.PI * P(t, ...TL.pass)));
+    } else if (t < TL.pause[0]) {
+      handsLocal = HANG;
+    } else {
+      // hands go behind the back for the pause and stay there on the way down
+      handsLocal = mixL(HANG, BEHIND, ioSin(P(t, TL.pause[0], TL.pause[0] + 0.5)));
+    }
+    const walking = lg.seg && lg.seg.name !== 'push';
+    const pose = {
+      Hf, hip: [hipX, hipY], phi, lean, headPitch: headAt(t), feet, hands, handsLocal, stretch: STRETCH,
+      coatLag: walking ? 0.6 : pushing ? 0.35 : 0,
+      armPole: pushing ? [-0.3, -1, 0.4] : null,
+    };
+    return { t, pose, stone, legs: lg, feetGround: feet.map((f, i) => ({ x: f[0], y: groundY(f[0]), planted: groundY(f[0]) - ANKLE - f[1] < 0.5 })) };
+  }
+
+  // ---------- story curves for the rest of the scene ----------
+  const env = (t, rise, fall) => {           // 0..1 with smooth rise and fall windows
+    if (t < rise[0]) return 0; if (t < rise[1]) return ioSin(P(t, ...rise));
+    if (t < fall[0]) return 1; if (t < fall[1]) return 1 - ioSin(P(t, ...fall)); return 0;
+  };
+  function sceneAt(t) {
+    t = ((t % DUR) + DUR) % DUR;
+    const open = env(t, TL.vistaFog.open, TL.vistaFog.close);            // fog over the vista lifts
+    const seam = t < 8 ? 1 - ioSin(P(t, ...TL.seamFog.fall)) : ioSin(P(t, ...TL.seamFog.rise));
+    const birds = [0, 1, 2].map((i) => {
+      const t0 = TL.birds[0] + i * 0.35, t1 = TL.birds[1] + i * 0.2, p = P(t, t0, t1);
+      const x = lerp(1215 + i * 26, 1940 + i * 30, p), y = 318 + i * 15 - 30 * p + 4 * Math.sin(t * 2.3 + i);
+      const alpha = Math.min(ioSin(P(t, t0, t0 + 0.6)), 1 - ioSin(P(t, t1 - 0.6, t1)));
+      return { x, y, s: 15 - i * 2, phase: i * 0.37, rate: 2.6 + i * 0.3, alpha: p > 0 && p < 1 ? alpha : 0 };
+    });
+    return { open, seam, birds, drift: Math.sin(2 * Math.PI * t / DUR) };
+  }
+
+  // ---------- events for the sound ----------
+  function events() {
+    const ev = [];
+    const dt = 1 / 480;
+    let prev = legsAt(0);
+    for (let t = dt; t < DUR; t += dt) {
+      const cur = legsAt(t);
+      for (let i = 0; i < 2; i++) if (!prev.feet[i].stance && prev.feet[i].lift > 0 && cur.feet[i].lift === 0 && cur.seg) ev.push({ type: 'step', t, foot: i, seg: cur.seg.name, x: xOf(cur.feet[i].s) });
+      prev = cur;
+    }
+    ev.push({ type: 'settle', t: TL.push[1] - 0.05 });
+    ev.push({ type: 'tip', t: TL.roll });
+    return ev;
+  }
+
+  G.SisyphusPlan = { W, H, DUR, FPS, Hf, R, TL, CONTOUR, groundY, sOf, xOf, normal, slope, at, sceneAt, stoneAt, legsAt, events, segs, EDGE_X, STONE_X0, STONE_X1 };
+  if (typeof module !== 'undefined') module.exports = G.SisyphusPlan;
+})(typeof window !== 'undefined' ? window : globalThis);
+
+/* sisyphus-scene.js — paints the scene of "Sisyphus" with grisaille.js and animates it from sisyphus-plan.js.
+ *
+ *   const L = SisyphusScene.build(T)          paint all static layers once (a few seconds)
+ *   SisyphusScene.draw(ctx, t, L)             draw frame t (only from t)
+ *
+ * Layers, back to front:
+ *   back     paper, sky with the pale sun, far trunks, distant ridges, the hill and its cliff
+ *   vista    fog over the ridges (lifts in the pause, drifts slowly)
+ *   light    paper lifted around the sun (the pause)
+ *   birds, shadows, stone, figure
+ *   low      the fog of the lower world (bottom left), always there
+ *   seam     the fog bank that swallows him at the bottom and gives him back (the loop point)
+ *   front    the foreground trunks, opaque
+ *   tooth    paper surface over everything
+ */
+(function (G) {
+  'use strict';
+  const GW = G.GW, S = G.SisyphusPlan;
+  const W = S.W, H = S.H, SUN = [1585, 395];
+
+  function build(T) {
+    const mk = () => GW.canvas(W, H);
+    const back = mk(), b = back.getContext('2d');
+    GW.paper(b, W, H, T);
+
+    // --- sky: one big wash, darker top left, lighter towards the sun, with dried blooms ---
+    GW.wash(b, [[-80, -80], [W + 80, -80], [W + 80, 820], [-80, 900]], {
+      T, seed: 101, tone: 0.56, spread: 0.02, jitter: 0.015, edge: 0, mottle: 0.6, blotch: 0.65, grain: 0.85,
+      fade: [{ x0: 0, y0: 0, x1: 0, y1: 860, stops: [[0, 1], [0.55, 0.75], [1, 0.25]] }],
+      radial: [{ x: SUN[0], y: SUN[1], r0: 30, r1: 900, stops: [[0, 0.05], [0.25, 0.35], [0.6, 0.8], [1, 1]] }],
+    });
+    GW.wash(b, [[-80, -80], [1150, -80], [900, 300], [-80, 520]], {
+      T, seed: 102, tone: 0.3, spread: 0.08, jitter: 0.05, edge: 0.35, edgeWidth: 10, mottle: 0.7, blotch: 0.5, soft: 6,
+      fade: [{ x0: 0, y0: 0, x1: 700, y1: 500, stops: [[0, 1], [1, 0]] }],
+    });
+    // pale sun: paper lifted in a soft disc with a faint halo
+    b.save(); b.filter = 'blur(6px)'; b.fillStyle = GW.paperRGBA(0.85); b.beginPath(); b.arc(SUN[0], SUN[1], 34, 0, Math.PI * 2); b.fill();
+    b.filter = 'blur(40px)'; b.fillStyle = GW.paperRGBA(0.35); b.beginPath(); b.arc(SUN[0], SUN[1], 120, 0, Math.PI * 2); b.fill(); b.restore();
+
+    // --- far trunks behind the hill (left half), uneven spacing and depth, fading into the mist above the contour ---
+    const r = GW.rng(7);
+    const farX = [34, 70, 150, 236, 262, 350, 436, 520, 548, 640, 706, 790, 846, 930, 990];
+    farX.forEach((x0, i) => {
+      const x = x0 + (r() - 0.5) * 16, gy = S.groundY(x);
+      const depth = Math.pow(r(), 0.8);         // 0 near … 1 far
+      const w = 34 - depth * 24 + r() * 8, tone = 0.62 - depth * 0.42;
+      const bottom = gy - 40 - depth * 60 - r() * 60;
+      GW.trunk(b, { T, seed: 300 + i, x, top: -30, bottom, w, tone, taper: 0.04, lean: (r() - 0.5) * 16,
+        fadeFrom: bottom - 200 - depth * 160 - r() * 120, fadeTo: bottom, edge: 0.65, mottle: 0.5, blotch: 0.35 });
+    });
+    // ghost trunks hanging from the top right, almost gone
+    [[1290, 24, 0.13, 250], [1420, 16, 0.09, 180], [1720, 30, 0.14, 320]].forEach(([x, w, tone, fy], i) => {
+      GW.trunk(b, { T, seed: 380 + i, x, top: -30, bottom: fy + 80, w, tone, taper: 0.03, fadeFrom: fy - 180, fadeTo: fy + 80, edge: 0.5, mottle: 0.5 });
+    });
+
+    // --- distant ridges on the open side ---
+    const ridge = (seed, y0, amp, tone, fadeTo, x0 = 1060) => {
+      const n = GW.noise(seed), pts = [];
+      for (let x = x0; x <= W + 80; x += 20) pts.push([x, y0 + amp * (GW.fbm(n, x * 0.004, 0.5, 4)) - amp * 0.4 * Math.sin((x - x0) * 0.004), 0.25]);
+      pts.push([W + 80, fadeTo + 60], [x0, fadeTo + 60]);
+      GW.wash(b, pts, { T, seed, tone, spread: 0.01, jitter: 0.008, edge: 0.7, edgeWidth: 5, mottle: 0.5, blotch: 0.4, maxLen: 40,
+        fade: [{ x0: 0, y0: y0 - amp, x1: 0, y1: fadeTo, stops: [[0, 1], [0.35, 0.8], [1, 0]] }] });
+    };
+    ridge(501, 548, 60, 0.14, 690);
+    ridge(502, 628, 70, 0.2, 790);
+    ridge(503, 738, 80, 0.3, 900, 1150);
+
+    // --- the hill: one wash, crisp along the path, rough on the cliff, fading into the fog below ---
+    const hill = [];
+    for (let x = -80; x <= 1500; x += 5) hill.push([x, S.groundY(x), x > 1140 ? 0.9 : 0.12]);
+    hill.push([1500, H + 80, 1], [-80, H + 80, 1]);
+    GW.wash(b, hill, {
+      T, seed: 601, tone: 0.62, spread: 0.0, jitter: 0.0022, depth: 3, maxLen: 24, layers: 26, edge: 0.95, edgeWidth: 6,
+      mottle: 0.75, blotch: 0.8, grain: 0.85,
+      fade: [{ x0: 0, y0: 470, x1: 0, y1: H, stops: [[0, 1], [0.3, 0.88], [1, 0.3]] }, { x0: -40, y0: 0, x1: 520, y1: 0, stops: [[0, 0.15], [1, 1]] }],
+    });
+    // a second, soft glaze high on the slope (the brush went over it again while wet)
+    const glaze = [];
+    for (let x = 600; x <= 1150; x += 8) glaze.push([x, S.groundY(x) + 4, 0.2]);
+    glaze.push([1150, 760, 1], [900, 820, 1], [700, 860, 1]);
+    GW.wash(b, glaze, { T, seed: 604, tone: 0.2, spread: 0.05, jitter: 0.03, maxLen: 40, edge: 0.4, edgeWidth: 8, soft: 10, mottle: 0.7, blotch: 0.5,
+      fade: [{ x0: 0, y0: 480, x1: 0, y1: 820, stops: [[0, 1], [1, 0]] }] });
+    // the cliff on the open side: darker rock, wet streaks running down into the fog
+    const cliff = [];
+    for (let x = 1124; x <= 1500; x += 5) cliff.push([x, S.groundY(x), 0.6]);
+    cliff.push([1500, H + 60, 1], [1100, H + 60, 1], [1020, 760, 1], [1030, 560, 0.5], [1080, 482, 0.2]);
+    GW.wash(b, cliff, { T, seed: 603, tone: 0.42, spread: 0.012, jitter: 0.01, maxLen: 24, edge: 0.0, mottle: 0.6, blotch: 0.6, streaky: true,
+      fade: [{ x0: 0, y0: 520, x1: 0, y1: 1020, stops: [[0, 1], [0.5, 0.6], [1, 0]] }, { x0: 1030, y0: 0, x1: 1175, y1: 0, stops: [[0, 0], [1, 1]] }] });
+    for (let k = 0; k < 9; k++) {
+      const x = 1150 + k * 30 + r() * 18, y0 = S.groundY(x) + 6, len = 90 + r() * 240, w = 5 + r() * 10, pts = [];
+      for (let i = 0; i <= 10; i++) { const v = i / 10; pts.push([x - w * Math.sin(Math.PI * v) / 2 - v * 22, y0 + len * v, 0.4]); }
+      for (let i = 10; i >= 0; i--) { const v = i / 10; pts.push([x + w * Math.sin(Math.PI * v) / 2 - v * 22, y0 + len * v, 0.4]); }
+      GW.wash(b, pts, { T, seed: 610 + k, tone: 0.32, layers: 10, spread: 0.02, jitter: 0.02, edge: 0.5, edgeWidth: 2, soft: 1.2, mottle: 0.5,
+        fade: [{ x0: 0, y0, x1: 0, y1: y0 + len, stops: [[0, 1], [1, 0]] }] });
+    }
+    // back-runs in the hill
+    GW.bloom(b, 1010, 660, 46, { T, seed: 42, tone: 0.22, lift: 0.1, squash: 0.7 });
+    GW.bloom(b, 640, 905, 90, { T, seed: 43, tone: 0.18, lift: 0.12, squash: 0.45 });
+    // dry-brush tufts along the path
+    {
+      b.save(); b.globalCompositeOperation = 'multiply'; b.filter = 'blur(0.5px)'; b.strokeStyle = GW.palette.pigment; b.lineCap = 'round';
+      for (let x = 380; x < 1135; x += 10 + r() * 26) {
+        const y = S.groundY(x) + 3 + r() * 5, h = 2 + r() * 6;
+        b.globalAlpha = 0.2 + r() * 0.25; b.lineWidth = 1 + r();
+        b.beginPath(); b.moveTo(x, y); b.lineTo(x + (r() - 0.6) * 4, y - h); b.stroke();
+      }
+      b.restore();
+    }
+    // a thin veil of mist in front of the far trunks, just above the slope
+    GW.fog(b, [[520, 600, 560, 80, 0.32], [260, 520, 360, 70, 0.24], [820, 470, 260, 50, 0.2]], { seed: 72, blur: 40 });
+
+    // --- static fog: the lower world (bottom left), the foot of the cliff ---
+    const low = GW.canvas(W + 240, H), lx = low.getContext('2d');
+    lx.translate(120, 0);
+    GW.fog(lx, [[150, 960, 420, 170, 0.95], [380, 1000, 330, 100, 0.85], [-60, 860, 260, 200, 0.85], [230, 905, 230, 90, 0.6],
+      [1330, 900, 300, 90, 0.75], [1700, 880, 320, 110, 0.6]], { seed: 71, blur: 50 });
+
+    // --- the ground in front: a dark, cloudy band of wash the whole picture stands on (like the reference) ---
+    const ground = GW.canvas(W + 240, H), gx = ground.getContext('2d');
+    gx.translate(120, 0);
+    // overlapping cloud-shaped patches with dark drying edges, glazed over each other
+    const rg = GW.rng(88);
+    const patches = [];
+    for (let i = 0; i < 12; i++) {
+      const x = -60 + (i + rg() * 0.8) * (W + 120) / 12, y = 1000 + rg() * 95, rx = 140 + rg() * 220, ry = 32 + rg() * 50;
+      patches.push([x, y, rx, ry, 0.15 + rg() * 0.15]);
+    }
+    patches.forEach(([x, y, rx, ry, tone], i) => {
+      GW.wash(gx, GW.circlePoly(x, y, rx, ry, 14, 1), { T, seed: 881 + i, tone, spread: 0.14, jitter: 0.04, edge: 0.9, edgeWidth: 6, mottle: 0.6, blotch: 0.7, grain: 0.95, soft: i % 3 === 0 ? 8 : 0,
+        fade: [{ x0: 0, y0: y - ry, x1: 0, y1: y + ry * 0.3, stops: [[0, 0.75], [1, 1]] }] });
+    });
+    [[700, 1058, 70, 0.5], [1420, 1068, 90, 0.45], [980, 1036, 40, 0.4]].forEach(([x, y, len, a], i) => GW.dash(gx, x, y, x - len * 3, y + 2, { w: 6, alpha: a, seed: 70 + i }));
+
+    // --- vista fog (animated): bands over the ridges, drawn wider than the frame so it can drift ---
+    const vista = GW.canvas(W + 200, H), fx = vista.getContext('2d');
+    fx.translate(100, 0);
+    GW.fog(fx, [[1350, 640, 340, 70, 0.9], [1700, 610, 380, 60, 0.85], [1500, 720, 420, 70, 0.9], [1900, 760, 300, 80, 0.85],
+      [1250, 790, 200, 70, 0.8], [1600, 860, 460, 90, 0.95], [1950, 540, 260, 50, 0.6], [1450, 545, 240, 40, 0.6]], { seed: 73, blur: 34 });
+
+    // --- seam fog: a bank lying in the hollow at the foot of the slope; it hides the loop point ---
+    // painted like a wash, but with paper: lifted, soft, a little uneven
+    const seam = GW.canvas(W + 300, H + 200), sx = seam.getContext('2d');
+    sx.translate(150, 100);
+    const nb = GW.noise(77), top = [], bot = [];
+    for (let x = 330; x <= 940; x += 16) {
+      const gy = S.groundY(x);
+      // billows: rounded lobes along the top of the bank
+      const lobe = 46 * Math.pow(Math.abs(Math.sin((x - 330) / 610 * Math.PI * 3.2 + 0.6)), 0.6) + 18 * nb(x * 0.02, 0.3);
+      top.push([x, gy - 190 - lobe + 50 * Math.pow(Math.abs((x - 620) / 320), 2), 0.5]);
+      bot.unshift([x, gy + 120, 0.5]);
+    }
+    const bankPoly = top.concat(bot);
+    for (let k = 0; k < 2; k++) GW.wash(sx, bankPoly, { T, seed: 780 + k, tone: 1, color: GW.palette.paper, mode: 'source-over', layers: 24, spread: 0.02, jitter: 0.03,
+      edge: 0, mottle: 0.25, blotch: 0.2, grain: 0, soft: 30, body: 0.97,
+      fade: [{ x0: 330, y0: 0, x1: 940, y1: 0, stops: [[0, 0], [0.2, 1], [0.8, 1], [1, 0]] }] });
+    GW.fog(sx, [[620, 600, 220, 110, 0.7], [520, 690, 180, 90, 0.7], [760, 560, 140, 80, 0.5], [450, 560, 120, 80, 0.4], [880, 470, 90, 60, 0.35]], { seed: 79, blur: 40 });
+
+    // --- foreground trunks (opaque) ---
+    const front = mk(), fr = front.getContext('2d');
+    GW.trunk(fr, { T, seed: 901, x: 405, top: -30, bottom: H + 40, w: 150, tone: 0.96, grain: 0.4, taper: -0.06, lean: -10, opaque: true, fadeFrom: 880, fadeTo: H + 80, edge: 0.8, blotch: 0.3, mottle: 0.4 });
+    GW.trunk(fr, { T, seed: 902, x: 88, top: -30, bottom: H + 40, w: 56, tone: 0.74, grain: 0.45, taper: -0.03, lean: 6, opaque: true, fadeFrom: 760, fadeTo: H - 20, edge: 0.7 });
+    GW.trunk(fr, { T, seed: 903, x: 1852, top: -30, bottom: H + 40, w: 70, tone: 0.86, grain: 0.45, taper: -0.04, lean: -8, opaque: true, fadeFrom: 820, fadeTo: H + 20, edge: 0.75 });
+
+    // --- drifting wisps in front of the hill (they sway with the camera and breathe) ---
+    const wisps = [[760, 830, 260, 26], [1240, 880, 300, 30], [420, 600, 220, 22], [1560, 760, 240, 24]].map(([x, y, rx, ry], i) => {
+      const c = GW.canvas(rx * 2 + 160, ry * 2 + 160), cx = c.getContext('2d');
+      GW.fog(cx, [[rx + 80, ry + 80, rx, ry, 0.75], [rx + 80 - rx * 0.4, ry + 80 + 4, rx * 0.6, ry * 0.8, 0.5]], { seed: 90 + i, blur: 18, rough: 0.2 });
+      return { c, x: x - rx - 80, y: y - ry - 80, phase: i * 1.7 };
+    });
+    const stone = GW.stoneTexture(S.R, 11, T);
+    return { back, low, ground, vista, seam, front, stone, wisps, T };
+  }
+
+  /** shadow dash for a planted foot / the stone: lies on the slope, falls to the left (light from the right) */
+  function shadow(ctx, x, len, w, alpha, seed) {
+    const y0 = S.groundY(x) + 1.5, x1 = x - len, y1 = S.groundY(x1) + 1.5;
+    GW.dash(ctx, x + 6, y0, x1, y1, { w, alpha, seed, tone: 0.85 });
+  }
+
+  // camera: a slow sideways drift over the loop; nearer layers move more (parallax)
+  const ZOOM = 1.022;
+  function camera(ctx, t, k) {
+    const dx = 15 * Math.sin(2 * Math.PI * t / S.DUR + 0.5) * k;
+    ctx.setTransform(ZOOM, 0, 0, ZOOM, (W / 2) * (1 - ZOOM) + dx, (H / 2) * (1 - ZOOM));
+  }
+
+  function draw(ctx, t, L) {
+    const A = S.at(t), C = S.sceneAt(t), T = L.T;
+    ctx.save();
+    ctx.fillStyle = GW.palette.paper; ctx.fillRect(0, 0, W, H);
+    camera(ctx, t, 1);
+    ctx.drawImage(L.back, 0, 0);
+    // vista fog: thick, lifts in the pause
+    camera(ctx, t, 0.8);
+    ctx.globalAlpha = 0.78 - 0.62 * C.open; ctx.drawImage(L.vista, -100 + 28 * C.drift, 0); ctx.globalAlpha = 1;
+    camera(ctx, t, 1);
+    // light: paper lifted around the sun
+    if (C.open > 0.001) {
+      const g = ctx.createRadialGradient(SUN[0], SUN[1], 20, SUN[0], SUN[1], 820);
+      g.addColorStop(0, GW.paperRGBA(0.55 * C.open)); g.addColorStop(0.3, GW.paperRGBA(0.3 * C.open)); g.addColorStop(1, GW.paperRGBA(0));
+      ctx.fillStyle = g; ctx.fillRect(-60, 0, W + 120, H);
+    }
+    GW.birds(ctx, C.birds, t, { tone: 0.62 });
+    // shadows
+    const st = A.stone, figFirst = t >= S.TL.pass[0] && t < S.TL.roll;   // walking behind the resting stone
+    A.feetGround.forEach((f, i) => { if (f.planted) shadow(ctx, f.x, 0.36 * S.Hf, 4.5, 0.6, 20 + i); });
+    if (st.visible) shadow(ctx, st.gx + 10, 1.6 * S.R, 6, 0.65 * st.alpha, 30);
+    const drawStone = () => {
+      if (!st.visible) return;
+      // the boulder is not round: it rests on its lowest point and rocks a little as it turns
+      const n = S.normal(st.gx), sup = GW.stoneSupport(L.stone, st.angle, n[0], n[1]);
+      const hop = st.gy + n[1] * S.R - st.y;
+      GW.stone(ctx, L.stone, st.gx + n[0] * sup, st.gy + n[1] * sup - hop, st.angle, { alpha: st.alpha });
+    };
+    const drawFig = () => GW.gentleman(ctx, Object.assign({ T, seed: 5, rim: 0.7 * C.open, rimDir: 1 }, A.pose));
+    if (figFirst) { drawFig(); drawStone(); } else { drawStone(); drawFig(); }
+    camera(ctx, t, 1.25);
+    ctx.drawImage(L.low, -120, 0);
+    // at the loop point the whole lower world swells a little, so the bank is part of the weather, not a lone cloud
+    if (C.seam > 0.001) { ctx.globalAlpha = 0.55 * C.seam; ctx.drawImage(L.low, -120, -60 * C.seam); ctx.globalAlpha = 1; ctx.fillStyle = GW.paperRGBA(0.12 * C.seam); ctx.fillRect(-60, 0, W + 120, H); }
+    // the bank: always faintly there; at the loop point it rises up the slope out of the lower world and lies over him
+    camera(ctx, t, 1.1);
+    { const k = C.seam, a = 0.14 + 0.86 * k; ctx.globalAlpha = a; ctx.drawImage(L.seam, -150 - 90 * (1 - k), -100 + 110 * (1 - k)); ctx.globalAlpha = 1; }
+    // the ground in front
+    camera(ctx, t, 1.8);
+    ctx.drawImage(L.ground, -120, 0);
+    // wisps drifting in front
+    camera(ctx, t, 1.6);
+    L.wisps.forEach((w, i) => {
+      const ph = 2 * Math.PI * t / S.DUR + w.phase;
+      ctx.globalAlpha = 0.35 + 0.25 * Math.sin(ph * 2); ctx.drawImage(w.c, w.x + 70 * Math.sin(ph), w.y + 6 * Math.sin(ph * 2));
+    });
+    ctx.globalAlpha = 1;
+    camera(ctx, t, 2.4);
+    ctx.drawImage(L.front, 0, 0);
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    GW.tooth(ctx, T, 1);
+    ctx.restore();
+  }
+
+  G.SisyphusScene = { build, draw, SUN };
+})(typeof window !== 'undefined' ? window : globalThis);
+
+</script>
+<script>
+
+// Sisyphus: a 16 s loop in grey watercolour, drawn entirely in code.
+// He pushes the stone up, lets it go, looks out into the light, and walks back down.
+// Same seed, same picture. Keys: space = pause, s = save PNG, r = new seed (new paper and washes).
+// URL: ?t=11.8 shows one moment of the loop.
+const params = { seed: 7, width: 1920, height: 1080 };
+
+const cv = document.getElementById('art'), ctx = cv.getContext('2d');
+cv.width = params.width; cv.height = params.height;
+const still = new URLSearchParams(location.search).get('t');
+let layers = null, paused = false, t0 = performance.now(), tp = 0;
+function build() {
+  layers = SisyphusScene.build(GW.textures(params.width, params.height, params.seed));
+  console.log('seed', params.seed);
+}
+function frame() {
+  const t = still != null ? +still : ((paused ? tp : performance.now()) - t0) / 1000 % SisyphusPlan.DUR;
+  SisyphusScene.draw(ctx, t, layers);
+  window.done = true;
+  if (still == null) requestAnimationFrame(frame);
+}
+build(); frame();
+addEventListener('keydown', (e) => {
+  if (e.key === ' ') { if (paused) t0 += performance.now() - tp; else tp = performance.now(); paused = !paused; e.preventDefault(); }
+  if (e.key === 's') { const a = document.createElement('a'); a.download = `sisyphus_s${params.seed}.png`; a.href = cv.toDataURL('image/png'); a.click(); }
+  if (e.key === 'r') { params.seed = Math.floor(Math.random() * 1e6); build(); }
+});
+
+</script>
+</html>
