@@ -1,0 +1,872 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Crossing · scribble</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #2a2622; }
+  body { display: grid; place-items: center; }
+  canvas { display: block; max-width: 100vw; max-height: 100vh; }
+</style>
+<canvas id="art" role="img" aria-label="A pen sketch seen straight down onto a zebra crossing on a wet street at night: people under dark umbrellas cross in both directions between two waiting cars with their headlights on, while rain rings spread on the asphalt."></canvas>
+<script>
+// same seed, same picture. t = where the loop starts in seconds (null: the key frame of the scene)
+var params = { seed: 7, t: null };
+new URLSearchParams(location.search).forEach((v, k) => { if (k in params) params[k] = +v; });
+</script>
+<script>
+/* scribble.js — drawing library for the style "Scribble Sketch" (Canvas 2D, no dependencies).
+ *
+ * A quick pen sketch in a sketchbook: one warm black ink on cream paper. Tone is never filled, it is
+ * scribbled: small zigzag patches whose spacing gives the value, and whose direction gives the material
+ * (sky diagonal, walls upright, wet street lying flat). Light is the paper that was left blank. Figures
+ * are dense zigzag scribbles with loose, overshooting edges, so they read as people from far and
+ * dissolve when you look closer. Towards the edges of the picture the drawing simply stops.
+ *
+ * All randomness runs through seeded generators (SK.rng, SK.hash, SK.noise); nothing depends on time
+ * or Math.random, so every frame of an animation can be redrawn alone.
+ *
+ * Main API (x right, y down, units px):
+ *   SK.palette                          colour tokens
+ *   SK.rng(seed) · SK.hash(...n) · SK.noise(x, y, seed) · SK.fbm(x, y, seed)
+ *   SK.canvas(w, h)                     offscreen canvas
+ *   SK.paper(ctx, w, h, seed)           cream paper with grain and a few fibres
+ *   SK.pen(ctx, pts, w, o)              one tapered pen stroke through points (Catmull-Rom)
+ *   SK.line(ctx, a, b, w, r, o)         a loose straight line: 1–3 passes, overshoot, slight bow
+ *   SK.zigzag(ctx, x, y, ang, len, wid, sp, lw, r)   one scribble patch (the unit of tone)
+ *   SK.hatch(ctx, o)                    a tonal field of patches from a darkness function
+ *   SK.fill(ctx, poly, o)               scribble-fill a polygon (back and forth, loose edges)
+ *   SK.squiggle(ctx, x0, x1, y, o, r)   a flat wavy stroke (reflections on a wet street)
+ *   SK.wash(ctx, x, y, r, a, o)         the warm lamplight wash (the only colour)
+ *   SK.lampGeo(x, by, gy, s) · SK.lamp(ctx, L, seed)  the street lamp
+ *   SK.walker(o, t) · SK.figure(ctx, F, o)            a passer-by: pose at time t, drawn as a scribble
+ */
+(function (G) {
+  'use strict';
+  const SK = {};
+
+  // ---------- tokens ----------
+  SK.palette = {
+    paper: '#EDE4D0',      // cream sketchbook paper
+    paperLight: '#F4EDDD', // paper in the light, rain lit from behind
+    ink: '#1E1A16',        // warm black ink, the only drawing colour
+    inkSoft: 'rgba(30,26,22,0.55)',
+    wash: '#E9BE62',       // the lamplight: a thin ochre wash, never more than 50 %
+    washDeep: '#D9A24A',
+    grain: '#CFC3A8',      // paper fibres
+  };
+  const P = SK.palette;
+
+  // ---------- randomness ----------
+  SK.rng = (seed) => {
+    let a = seed >>> 0;
+    return () => { a |= 0; a = (a + 0x6D2B79F5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+  };
+  /** Stateless hash of integers → 0..1 */
+  SK.hash = (...n) => {
+    let h = 2166136261 >>> 0;
+    for (const v of n) { h ^= (v | 0) + 0x9e3779b9 + (h << 6) + (h >>> 2); h = Math.imul(h, 16777619) >>> 0; }
+    h ^= h >>> 15; h = Math.imul(h, 0x2c1b3c6d) >>> 0; h ^= h >>> 12; h = Math.imul(h, 0x297a2d39) >>> 0; h ^= h >>> 15;
+    return (h >>> 0) / 4294967296;
+  };
+  const sm = (t) => t * t * (3 - 2 * t);
+  /** Smooth value noise 0..1 */
+  SK.noise = (x, y, seed = 0) => {
+    const xi = Math.floor(x), yi = Math.floor(y), xf = x - xi, yf = y - yi;
+    const a = SK.hash(xi, yi, seed), b = SK.hash(xi + 1, yi, seed), c = SK.hash(xi, yi + 1, seed), d = SK.hash(xi + 1, yi + 1, seed);
+    const u = sm(xf), v = sm(yf);
+    return a + (b - a) * u + (c - a) * v + (a - b - c + d) * u * v;
+  };
+  SK.fbm = (x, y, seed = 0) => 0.55 * SK.noise(x, y, seed) + 0.3 * SK.noise(x * 2.1, y * 2.1, seed + 7) + 0.15 * SK.noise(x * 4.3, y * 4.3, seed + 13);
+  SK.clamp = (x, a = 0, b = 1) => (x < a ? a : x > b ? b : x);
+  SK.smooth = (a, b, x) => { const t = SK.clamp((x - a) / (b - a)); return t * t * (3 - 2 * t); };
+  SK.lerp = (a, b, t) => a + (b - a) * t;
+  SK.canvas = (w, h) => { const c = document.createElement('canvas'); c.width = w; c.height = h; return c; };
+
+  // ---------- paper ----------
+  /** Cream paper: flat colour, fine grain, a few fibres, very slightly darker towards the edges. */
+  SK.paper = (ctx, w, h, seed = 1) => {
+    ctx.save();
+    ctx.fillStyle = P.paper; ctx.fillRect(0, 0, w, h);
+    const r = SK.rng(seed);
+    const img = ctx.getImageData(0, 0, ctx.canvas.width, ctx.canvas.height), d = img.data, cw = ctx.canvas.width, ch = ctx.canvas.height;
+    for (let y = 0; y < ch; y++) for (let x = 0; x < cw; x++) {
+      const i = (y * cw + x) * 4;
+      const n = (r() - 0.5) * 7 + (SK.noise(x / 9, y / 9, seed) - 0.5) * 6;
+      const ex = Math.min(x, cw - 1 - x) / cw, ey = Math.min(y, ch - 1 - y) / ch;
+      const edge = (1 - SK.smooth(0, 0.12, Math.min(ex, ey))) * 7;
+      d[i] += n - edge; d[i + 1] += n - edge * 1.1; d[i + 2] += n - edge * 1.4;
+    }
+    ctx.putImageData(img, 0, 0);
+    ctx.strokeStyle = P.grain; ctx.lineCap = 'round';
+    for (let k = 0; k < (w * h) / 9000; k++) {
+      const x = r() * w, y = r() * h, a = r() * Math.PI, l = 4 + r() * 12;
+      ctx.globalAlpha = 0.25 + r() * 0.3; ctx.lineWidth = 0.5 + r() * 0.4;
+      ctx.beginPath(); ctx.moveTo(x, y); ctx.quadraticCurveTo(x + Math.cos(a) * l * 0.5 + (r() - 0.5) * 3, y + Math.sin(a) * l * 0.5 + (r() - 0.5) * 3, x + Math.cos(a) * l, y + Math.sin(a) * l); ctx.stroke();
+    }
+    ctx.restore();
+  };
+
+  // ---------- pen ----------
+  /** Catmull-Rom resampling of an open polyline (seg points per span). */
+  SK.spline = (pts, seg = 6) => {
+    const n = pts.length; if (n < 3) {
+      if (n < 2) return pts.slice();
+      const o = []; for (let i = 0; i <= seg; i++) { const u = i / seg; o.push([pts[0][0] + (pts[1][0] - pts[0][0]) * u, pts[0][1] + (pts[1][1] - pts[0][1]) * u]); } return o;
+    }
+    const o = [];
+    for (let i = 0; i < n - 1; i++) {
+      const p0 = pts[Math.max(0, i - 1)], p1 = pts[i], p2 = pts[i + 1], p3 = pts[Math.min(n - 1, i + 2)];
+      for (let j = 0; j < seg; j++) {
+        const t = j / seg, t2 = t * t, t3 = t2 * t;
+        o.push([0.5 * (2 * p1[0] + (-p0[0] + p2[0]) * t + (2 * p0[0] - 5 * p1[0] + 4 * p2[0] - p3[0]) * t2 + (-p0[0] + 3 * p1[0] - 3 * p2[0] + p3[0]) * t3),
+                0.5 * (2 * p1[1] + (-p0[1] + p2[1]) * t + (2 * p0[1] - 5 * p1[1] + 4 * p2[1] - p3[1]) * t2 + (-p0[1] + 3 * p1[1] - 3 * p2[1] + p3[1]) * t3)]);
+      }
+    }
+    o.push(pts[n - 1].slice(0, 2));
+    return o;
+  };
+
+  /** One pen stroke: a filled polygon around the spline, tapered at both ends, pressure wobbling along it.
+   *  o: { col, alpha, t0, t1 (taper fractions), min (thinnest, x w), seed, seg } */
+  SK.pen = (ctx, pts, w, o = {}) => {
+    const sp = SK.spline(pts, o.seg ?? 6), n = sp.length; if (n < 2) return;
+    const L = [], R = [], seed = o.seed ?? 3, t0 = o.t0 ?? 0.18, t1 = o.t1 ?? 0.3, mn = o.min ?? 0.3;
+    let len = 0; const cum = [0];
+    for (let i = 1; i < n; i++) { len += Math.hypot(sp[i][0] - sp[i - 1][0], sp[i][1] - sp[i - 1][1]); cum.push(len); }
+    for (let i = 0; i < n; i++) {
+      const a = sp[Math.max(0, i - 1)], b = sp[Math.min(n - 1, i + 1)];
+      let dx = b[0] - a[0], dy = b[1] - a[1]; const dl = Math.hypot(dx, dy) || 1; dx /= dl; dy /= dl;
+      const u = len ? cum[i] / len : 0;
+      const prof = Math.min(1, t0 ? u / t0 : 1, t1 ? (1 - u) / t1 : 1);
+      const pr = 0.8 + 0.4 * SK.noise(cum[i] / 40, 0.5, seed);
+      const hw = (w / 2) * (mn + (1 - mn) * sm(SK.clamp(prof))) * pr;
+      L.push([sp[i][0] - dy * hw, sp[i][1] + dx * hw]); R.push([sp[i][0] + dy * hw, sp[i][1] - dx * hw]);
+    }
+    ctx.save();
+    ctx.fillStyle = o.col || P.ink; ctx.globalAlpha *= o.alpha ?? 1;
+    ctx.beginPath(); ctx.moveTo(L[0][0], L[0][1]);
+    for (let i = 1; i < n; i++) ctx.lineTo(L[i][0], L[i][1]);
+    for (let i = n - 1; i >= 0; i--) ctx.lineTo(R[i][0], R[i][1]);
+    ctx.closePath(); ctx.fill();
+    ctx.restore();
+  };
+
+  /** A loose straight line from a to b: passes (1–3) that miss each other a little, overshoot at the ends, slight bow.
+   *  o: { passes, over, bow, col, alpha, jit } */
+  SK.line = (ctx, a, b, w, r, o = {}) => {
+    const passes = o.passes ?? 2, over = o.over ?? 6, bow = o.bow ?? 0.012, jit = o.jit ?? 1.6;
+    const dx = b[0] - a[0], dy = b[1] - a[1], l = Math.hypot(dx, dy) || 1, ux = dx / l, uy = dy / l, nx = -uy, ny = ux;
+    for (let p = 0; p < passes; p++) {
+      const e0 = (r() - 0.35) * over, e1 = (r() - 0.35) * over, off = (r() - 0.5) * jit * 2, bw = (r() - 0.5) * 2 * bow * l;
+      const A = [a[0] - ux * e0 + nx * off, a[1] - uy * e0 + ny * off], B = [b[0] + ux * e1 + nx * (off + (r() - 0.5) * jit), b[1] + uy * e1 + ny * (off + (r() - 0.5) * jit)];
+      const M = [(A[0] + B[0]) / 2 + nx * bw, (A[1] + B[1]) / 2 + ny * bw];
+      SK.pen(ctx, [A, M, B], w * (p ? 0.75 : 1) * (0.85 + r() * 0.3), { col: o.col, alpha: (o.alpha ?? 1) * (p ? 0.8 : 1), seed: (r() * 1e6) | 0, t0: 0.08, t1: 0.25, min: 0.35 });
+    }
+  };
+
+  /** A loose path through points (several passes). */
+  SK.path = (ctx, pts, w, r, o = {}) => {
+    const passes = o.passes ?? 2, jit = o.jit ?? 1.4;
+    for (let p = 0; p < passes; p++) {
+      const q = pts.map(([x, y]) => [x + (r() - 0.5) * jit * 2, y + (r() - 0.5) * jit * 2]);
+      SK.pen(ctx, q, w * (p ? 0.75 : 1) * (0.85 + r() * 0.3), { col: o.col, alpha: (o.alpha ?? 1) * (p ? 0.8 : 1), seed: (r() * 1e6) | 0, t0: 0.06, t1: 0.15, min: 0.4 });
+    }
+  };
+
+  // ---------- scribble ----------
+  /** Draw a zigzag as one stroked path: each leg slightly bowed, turns rounded by the round join. */
+  function strokeZig(ctx, pts, lw, r, bow = 0.08) {
+    if (pts.length < 2) return;
+    ctx.lineWidth = lw;
+    ctx.beginPath(); ctx.moveTo(pts[0][0], pts[0][1]);
+    for (let i = 1; i < pts.length; i++) {
+      const a = pts[i - 1], b = pts[i], dx = b[0] - a[0], dy = b[1] - a[1];
+      const k = (r() - 0.5) * 2 * bow;
+      ctx.quadraticCurveTo((a[0] + b[0]) / 2 - dy * k, (a[1] + b[1]) / 2 + dx * k, b[0], b[1]);
+    }
+    ctx.stroke();
+  }
+  SK.strokeZig = strokeZig;
+
+  /** One scribble patch: a zigzag of `len` along angle `ang`, `wid` across, legs `sp` apart. The unit of tone. */
+  SK.zigzag = (ctx, cx, cy, ang, len, wid, sp, lw, r, open = 7.5) => {
+    const ux = Math.cos(ang), uy = Math.sin(ang), vx = -uy, vy = ux;
+    const n = Math.max(1, Math.round(wid / sp)), pts = [];
+    if (sp > open) {
+      // loose: separate, nearly parallel strokes instead of a zigzag (no sawtooth where the tone is light)
+      ctx.lineWidth = lw; ctx.beginPath();
+      for (let k = 0; k <= n; k++) {
+        const off = -wid / 2 + (k * wid) / n + (r() - 0.5) * sp * 0.5, l0 = (len / 2) * (0.55 + 0.45 * r()), l1 = (len / 2) * (0.55 + 0.45 * r()), sk = (r() - 0.5) * sp * 0.4;
+        const ax = cx + vx * off - ux * l0, ay = cy + vy * off - uy * l0, bx = cx + vx * (off + sk) + ux * l1, by = cy + vy * (off + sk) + uy * l1, bw = (r() - 0.5) * 0.08 * len;
+        ctx.moveTo(ax, ay); ctx.quadraticCurveTo((ax + bx) / 2 + vx * bw, (ay + by) / 2 + vy * bw, bx, by);
+      }
+      ctx.stroke();
+      return;
+    }
+    for (let k = 0; k <= n; k++) {
+      const off = -wid / 2 + (k * wid) / n + (r() - 0.5) * sp * 0.6;
+      const side = k % 2 ? 1 : -1, l = (len / 2) * (0.62 + 0.38 * r());
+      pts.push([cx + vx * off + ux * side * l, cy + vy * off + uy * side * l]);
+    }
+    strokeZig(ctx, pts, lw, r);
+  };
+
+  /** A tonal field. field(x, y) → { d: darkness 0..1, ang, len, wid } (or null to skip).
+   *  o: { w, h, cell, seed, layers: [{ thr, dAng, spMax, spMin, lw }], col, alpha, x0, y0 } */
+  SK.hatch = (ctx, o) => {
+    const r = SK.rng(o.seed ?? 5), cell = o.cell ?? 24;
+    ctx.save(); ctx.strokeStyle = o.col || P.ink; ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+    for (let li = 0; li < o.layers.length; li++) {
+      const L = o.layers[li];
+      for (let gy = (o.y0 ?? 0) - cell; gy < (o.h ?? 0) + cell; gy += cell) {
+        for (let gx = (o.x0 ?? 0) - cell; gx < (o.w ?? 0) + cell; gx += cell) {
+          const x = gx + r() * cell, y = gy + r() * cell, f = o.field(x, y);
+          const j1 = r(), j2 = r(), j3 = r(), j4 = r(), j5 = r();
+          if (!f) continue;
+          const thr = L.thr + (j1 - 0.5) * (L.spread ?? 0.14);
+          if (f.d <= thr) continue;
+          const k = SK.clamp((f.d - thr) / Math.max(0.05, 1 - L.thr));
+          const sp = SK.lerp(L.spMax, L.spMin, Math.pow(k, 0.8));
+          ctx.globalAlpha = (o.alpha ?? 0.9) * (0.7 + 0.3 * j2) * SK.clamp(0.35 + k * 1.5);
+          const ang = f.angs ? f.angs[li % f.angs.length] : f.ang + (L.dAng ?? 0);
+          SK.zigzag(ctx, x, y, ang + (j3 - 0.5) * (L.angJit ?? 0.22) * (f.jit ?? 1), f.len * (0.6 + 0.8 * j4), f.wid * (0.7 + 0.6 * j5), sp, (L.lw ?? 1.1) * (f.lw ?? 1) * (0.8 + 0.4 * r()), r);
+        }
+      }
+    }
+    ctx.restore();
+  };
+
+  /** Scribble-fill a polygon: lines across at angle `ang`, joined back and forth into a continuous scribble that
+   *  overshoots the outline. o: { ang, sp, lw, over, keep (0..1 chance a leg is drawn), r, brk (legs per pen lift), alpha, col, skip(x,y) } */
+  SK.fill = (ctx, poly, o) => {
+    const r = o.r, a = o.ang, ux = Math.cos(a), uy = Math.sin(a), vx = -uy, vy = ux;
+    const pr = poly.map(([x, y]) => [x * vx + y * vy, x * ux + y * uy]);
+    let sMin = Infinity, sMax = -Infinity;
+    for (const p of pr) { sMin = Math.min(sMin, p[0]); sMax = Math.max(sMax, p[0]); }
+    const sp = o.sp, over = o.over ?? 4, keep = o.keep ?? 1, brk = o.brk ?? 14;
+    ctx.save(); ctx.strokeStyle = o.col || P.ink; ctx.lineJoin = 'round'; ctx.lineCap = 'round'; ctx.globalAlpha *= o.alpha ?? 1;
+    let run = [], k = 0, flip = r() < 0.5;
+    const flush = () => { if (run.length > 1) strokeZig(ctx, run, o.lw * (0.8 + 0.4 * r()), r, o.bow ?? 0.05); run = []; };
+    for (let s = sMin + sp * r() * 0.8; s < sMax; s += sp * (0.75 + 0.5 * r())) {
+      let q0 = Infinity, q1 = -Infinity;
+      for (let i = 0; i < pr.length; i++) {
+        const p = pr[i], q = pr[(i + 1) % pr.length];
+        if ((p[0] - s) * (q[0] - s) <= 0 && p[0] !== q[0]) { const qq = p[1] + ((s - p[0]) / (q[0] - p[0])) * (q[1] - p[1]); q0 = Math.min(q0, qq); q1 = Math.max(q1, qq); }
+      }
+      if (q1 <= q0) { flush(); continue; }
+      const e0 = q0 - (r() - 0.3) * over, e1 = q1 + (r() - 0.3) * over;
+      const A = [s * vx + e0 * ux, s * vy + e0 * uy], B = [s * vx + e1 * ux, s * vy + e1 * uy];
+      if (r() > keep || (o.skip && o.skip((A[0] + B[0]) / 2, (A[1] + B[1]) / 2))) { flush(); continue; }
+      if (flip) run.push(B, A); else run.push(A, B);
+      flip = !flip; k++;
+      if (k % brk === 0 || r() < 0.04) { flush(); }
+    }
+    flush();
+    ctx.restore();
+  };
+
+  /** A flat wavy stroke from x0 to x1 at height y (reflection on a wet street). o: { amp, wl, lw, col, alpha } */
+  SK.squiggle = (ctx, x0, x1, y, o, r) => {
+    const amp = o.amp ?? 2.5, wl = o.wl ?? 26, pts = [], n = Math.max(2, Math.ceil(Math.abs(x1 - x0) / (wl / 2)));
+    for (let i = 0; i <= n; i++) pts.push([x0 + ((x1 - x0) * i) / n + (r() - 0.5) * wl * 0.2, y + (i % 2 ? amp : -amp) * (0.5 + r() * 0.7)]);
+    SK.pen(ctx, pts, o.lw ?? 1.6, { col: o.col, alpha: o.alpha ?? 1, seed: (r() * 1e6) | 0, seg: 4, t0: 0.1, t1: 0.2, min: 0.35 });
+  };
+
+  /** Warm lamplight wash: a soft radial spot of ochre, multiplied onto the paper. o: { sx, sy (squash), col } */
+  SK.wash = (ctx, x, y, rad, a, o = {}) => {
+    ctx.save();
+    ctx.globalCompositeOperation = 'multiply';
+    ctx.translate(x, y); ctx.scale(o.sx ?? 1, o.sy ?? 1);
+    const g = ctx.createRadialGradient(0, 0, 0, 0, 0, rad), c = o.rgb || [233, 190, 98];
+    g.addColorStop(0, `rgba(${c},${a})`); g.addColorStop(0.45, `rgba(${c},${a * 0.55})`); g.addColorStop(1, `rgba(${c},0)`);
+    ctx.fillStyle = g; ctx.beginPath(); ctx.arc(0, 0, rad, 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
+  };
+
+  // ---------- the street lamp ----------
+  /** Geometry of an old lantern lamp: base at (x, by), centre of the glass at gy, scale s (1 ≈ 800 px tall). */
+  SK.lampGeo = (x, by, gy, s = 1) => ({
+    x, by, gy, s,
+    glassTop: gy - 40 * s, glassBot: gy + 36 * s, wTop: 33 * s, wBot: 20 * s,   // half widths of the glass
+    roofBrim: gy - 46 * s, roofTop: gy - 104 * s, brim: 46 * s,
+    cup: gy + 54 * s, collar: gy + 70 * s, arm: gy + 96 * s, armW: 44 * s,
+    shaftTop: gy + 74 * s, shaftW0: 5 * s, shaftW1: 9 * s,
+    ring: by - 120 * s, plinth: by - 70 * s, plinthW: 22 * s, footW: 30 * s,
+  });
+
+  /** The lamp as a sketch: iron parts scribbled dark, glass left as paper, lines that search a little. */
+  SK.lamp = (ctx, L, seed = 1, o = {}) => {
+    const r = SK.rng(seed), s = L.s, x = L.x, lw = 1.7 * s, ink = P.ink;
+    ctx.save();
+    // shaft: two loose lines and a dark vertical scribble between them
+    const shaft = [[x - L.shaftW0, L.shaftTop], [x + L.shaftW0, L.shaftTop], [x + L.shaftW1, L.plinth], [x - L.shaftW1, L.plinth]];
+    SK.fill(ctx, shaft, { ang: Math.PI / 2 + 0.05, sp: 2.1 * s, lw: 1.3 * s, over: 2.5 * s, r, brk: 9, alpha: 0.95 });
+    SK.line(ctx, [x - L.shaftW0, L.shaftTop], [x - L.shaftW1, L.plinth], lw, r, { over: 8 * s });
+    SK.line(ctx, [x + L.shaftW0, L.shaftTop], [x + L.shaftW1, L.plinth], lw * 0.8, r, { over: 8 * s, passes: 1 });
+    // rings on the shaft
+    for (const [yy, ww] of [[L.ring, 14 * s], [L.ring + 12 * s, 12 * s], [L.collar + 6 * s, 10 * s]]) {
+      SK.fill(ctx, [[x - ww, yy - 4 * s], [x + ww, yy - 4 * s], [x + ww * 0.9, yy + 4 * s], [x - ww * 0.9, yy + 4 * s]], { ang: 0.1, sp: 2 * s, lw: 1.2 * s, over: 2 * s, r, alpha: 0.95 });
+    }
+    // plinth and foot
+    const pl = [[x - L.plinthW * 0.55, L.plinth - 6 * s], [x + L.plinthW * 0.55, L.plinth - 6 * s], [x + L.plinthW, L.by - 16 * s], [x + L.footW, L.by - 8 * s], [x + L.footW, L.by], [x - L.footW, L.by], [x - L.footW, L.by - 8 * s], [x - L.plinthW, L.by - 16 * s]];
+    SK.fill(ctx, pl, { ang: Math.PI / 2 - 0.15, sp: 2.2 * s, lw: 1.3 * s, over: 3 * s, r, brk: 8, alpha: 0.95 });
+    SK.path(ctx, [pl[1], pl[2], pl[3], pl[4]], lw, r, { passes: 1 });
+    SK.line(ctx, [x - L.footW - 10 * s, L.by + 1], [x + L.footW + 14 * s, L.by + 2], lw, r, { passes: 2, over: 10 * s });
+    // ladder arm (the cross bar under the lantern) with ball ends
+    SK.line(ctx, [x - L.armW, L.arm], [x + L.armW, L.arm], lw * 1.3, r, { passes: 2, over: 3 * s });
+    for (const sd of [-1, 1]) {
+      ctx.fillStyle = ink; ctx.beginPath(); ctx.arc(x + sd * (L.armW + 3 * s), L.arm, 4.2 * s, 0, Math.PI * 2); ctx.fill();
+      SK.pen(ctx, [[x + sd * L.armW * 0.55, L.arm], [x + sd * L.armW * 0.25, L.arm - 14 * s], [x + sd * 6 * s, L.arm - 22 * s]], 1.4 * s, { seed: seed + sd });
+    }
+    // cup under the glass
+    const cup = [[x - L.wBot - 3 * s, L.glassBot], [x + L.wBot + 3 * s, L.glassBot], [x + 9 * s, L.cup], [x + 5 * s, L.collar], [x - 5 * s, L.collar], [x - 9 * s, L.cup]];
+    SK.fill(ctx, cup, { ang: 0.15, sp: 2 * s, lw: 1.3 * s, over: 2 * s, r, alpha: 0.95 });
+    // glass: outline, mullions; the inside stays paper
+    const gl = [[x - L.wTop, L.glassTop], [x + L.wTop, L.glassTop], [x + L.wBot, L.glassBot], [x - L.wBot, L.glassBot]];
+    SK.line(ctx, gl[0], gl[3], lw, r, { over: 4 * s });
+    SK.line(ctx, gl[1], gl[2], lw, r, { over: 4 * s });
+    SK.line(ctx, gl[3], gl[2], lw, r, { over: 3 * s, passes: 1 });
+    for (const f of [-0.42, 0.38]) SK.line(ctx, [x + L.wTop * f, L.glassTop + 2 * s], [x + L.wBot * f, L.glassBot - 2 * s], 1.1 * s, r, { passes: 1, over: 2 * s, alpha: 0.85 });
+    // the flame: a small scribble in the middle of the glass
+    if (o.flame !== false) {
+      SK.pen(ctx, [[x - 1 * s, L.gy + 22 * s], [x - 5 * s, L.gy + 12 * s], [x - 3 * s, L.gy + 3 * s], [x + 1 * s, L.gy], [x + 4 * s, L.gy + 6 * s], [x + 4 * s, L.gy + 15 * s], [x + 1 * s, L.gy + 22 * s]], 1.1 * s, { seed: seed + 4, alpha: 0.75, t0: 0.1, t1: 0.1 });
+      SK.line(ctx, [x - 7 * s, L.gy + 26 * s], [x + 7 * s, L.gy + 26 * s], 1.6 * s, r, { passes: 1, over: 1 });
+    }
+    // roof: a dark hat, its underside lit
+    const roof = [[x - L.brim, L.roofBrim + 2 * s], [x - L.brim * 0.62, L.roofBrim - 12 * s], [x - 7 * s, L.roofTop + 6 * s], [x + 7 * s, L.roofTop + 6 * s], [x + L.brim * 0.62, L.roofBrim - 12 * s], [x + L.brim, L.roofBrim + 2 * s]];
+    SK.fill(ctx, roof, { ang: -1.15, sp: 2.2 * s, lw: 1.3 * s, over: 3 * s, r, brk: 10, alpha: 0.95 });
+    SK.path(ctx, roof, lw, r, { passes: 2 });
+    SK.line(ctx, [x - L.brim - 4 * s, L.roofBrim + 3 * s], [x + L.brim + 4 * s, L.roofBrim + 3 * s], lw * 1.2, r, { passes: 2 });
+    SK.line(ctx, [x - L.wTop - 4 * s, L.glassTop], [x + L.wTop + 4 * s, L.glassTop], lw, r, { passes: 1 });
+    // finial
+    ctx.fillStyle = ink; ctx.beginPath(); ctx.arc(x, L.roofTop - 2 * s, 5.5 * s, 0, Math.PI * 2); ctx.fill();
+    SK.pen(ctx, [[x, L.roofTop - 6 * s], [x + 0.5, L.roofTop - 18 * s], [x, L.roofTop - 30 * s]], 2.4 * s, { seed: seed + 9, t0: 0.05, t1: 0.9 });
+    ctx.restore();
+  };
+
+  // ---------- passers-by ----------
+  /** Pose of a walker at time t.  o: { x, y (feet on the ground), h (figure height px), dir (+1 right, −1 left),
+   *  cycles (walk cycles per loop), dur, phase, kind: 'umbrella' | 'hat' }. Returns key points in px. */
+  SK.walker = (o, t) => {
+    const ph = 2 * Math.PI * ((t / o.dur) * o.cycles + (o.phase ?? 0));
+    const h = o.h, d = o.dir;
+    const bob = -Math.abs(Math.cos(ph)) * 0.014 * h + 0.007 * h;
+    const step = (o.step ?? 0.17) * h;                      // half the stride
+    const sw = Math.sin(ph), lift = (u) => Math.max(0, u) * 0.05 * h;
+    // foot A swings forward while sin rises; B is opposite
+    const fA = [o.x + d * step * Math.sin(ph), o.y - lift(Math.cos(ph))];
+    const fB = [o.x - d * step * Math.sin(ph), o.y - lift(-Math.cos(ph))];
+    return { ...o, ph, bob, sw, fA, fB };
+  };
+
+  // outlines of the coats in units of the figure height, forward = +u, up = −v (feet at 0, top of the head at −1)
+  const COAT = {
+    umbrella: [[-0.05, -0.865], [-0.112, -0.818], [-0.134, -0.74], [-0.14, -0.6], [-0.148, -0.45], [-0.162, -0.33], [-0.185, -0.255], [-0.11, -0.238], [0.0, -0.246], [0.1, -0.242], [0.158, -0.268], [0.142, -0.4], [0.132, -0.52], [0.152, -0.6], [0.158, -0.665], [0.125, -0.75], [0.095, -0.812], [0.04, -0.865]],
+    hat: [[-0.045, -0.88], [-0.1, -0.86], [-0.125, -0.8], [-0.135, -0.66], [-0.142, -0.5], [-0.158, -0.34], [-0.19, -0.23], [-0.1, -0.215], [0.0, -0.222], [0.1, -0.218], [0.165, -0.24], [0.148, -0.38], [0.14, -0.52], [0.135, -0.66], [0.12, -0.8], [0.085, -0.86], [0.04, -0.885]],
+  };
+
+  /** Draw a passer-by as a scribble.  F from SK.walker.  o: { seed, vis (0..1 how much of it is drawn: fewer, looser
+   *  strokes as it falls), lit (0..1 light on the umbrella), sp (scribble spacing px), lw } */
+  SK.figure = (ctx, F, o = {}) => {
+    const vis = o.vis ?? 1; if (vis <= 0.03) return;
+    const r = SK.rng(o.seed ?? 1), h = F.h, d = F.dir, lean = 0.035;
+    const X = (u, v) => F.x + d * (u + lean * Math.max(0, -v - 0.3)) * h, Y = (v) => F.y + v * h + F.bob;
+    const pt = ([u, v]) => [X(u, v), Y(v)];
+    const sp = (o.sp ?? 2.8) / Math.pow(Math.max(0.3, vis), 0.8), lw = (o.lw ?? 1.9) * Math.min(1, 0.6 + h / 700), over = (o.over ?? 0.014) * h;
+    const keep = SK.clamp(0.15 + vis);
+    const base = { r, sp, lw, over, keep, alpha: o.alpha ?? 0.95 };
+    ctx.save();
+    ctx.globalAlpha *= SK.clamp(vis * 1.7);      // a passer-by fades as well as thins out
+    // a faint trailing copy of the coat: the blur of walking
+    if (o.ghost) {
+      const back = COAT[F.kind === 'hat' ? 'hat' : 'umbrella'];
+      for (const [k, a] of [[0.05, o.ghost], [0.1, o.ghost * 0.5]]) {
+        const g = back.map(([u, v]) => [X(u - k, v), Y(v)]);
+        SK.fill(ctx, g, { ...base, ang: -1.1 * d, sp: sp * 2.4, keep: keep * 0.7, alpha: a, brk: 6, over: over * 2 });
+      }
+    }
+    ctx.globalAlpha *= base.alpha;
+    // legs: two tapered strokes under the coat, knees slightly bent, a short stroke for the shoe
+    for (const f of [F.fB, F.fA]) {
+      const hip = [X(0, -0.36) + (f[0] - F.x) * 0.25, Y(-0.36)];
+      const knee = [(hip[0] + f[0]) / 2 + d * 0.014 * h, (hip[1] + f[1]) / 2];
+      if (r() < keep) SK.pen(ctx, [hip, knee, [f[0], f[1] - 0.015 * h]], 0.036 * h + 1, { seed: (r() * 1e6) | 0, t0: 0.02, t1: 0.3, min: 0.5 });
+      if (r() < keep * 0.7) SK.pen(ctx, [[hip[0] + d * 0.012 * h, hip[1]], [knee[0] + d * 0.01 * h, knee[1]]], 0.016 * h + 0.8, { seed: (r() * 1e6) | 0, t0: 0.1, t1: 0.4 });
+      SK.pen(ctx, [[f[0] - d * 0.025 * h, f[1] - 0.01 * h], [f[0] + d * 0.02 * h, f[1] - 0.004 * h], [f[0] + d * 0.05 * h, f[1] + 0.002 * h]], 0.026 * h + 0.8, { seed: (r() * 1e6) | 0, t0: 0.1, t1: 0.5 });
+    }
+    ctx.globalAlpha /= base.alpha;
+    // coat: the back of the hem swings with the stride
+    const coat = COAT[F.kind === 'hat' ? 'hat' : 'umbrella'].map(([u, v], i) => {
+      const swing = v > -0.3 ? F.sw * 0.018 * (u < 0 ? 1 : 0.5) : 0;
+      return pt([u + swing, v]);
+    });
+    const cx = coat.reduce((a, p) => a + p[0], 0) / coat.length, cy = coat.reduce((a, p) => a + p[1], 0) / coat.length;
+    const core = coat.map(([x, y]) => [cx + (x - cx) * 0.62, cy + (y - cy) * 0.8]);
+    SK.fill(ctx, coat, { ...base, ang: -1.22 * d, brk: 12 });
+    SK.fill(ctx, coat, { ...base, ang: -0.82 * d, sp: sp * 1.7, keep: keep * 0.6, brk: 7 });
+    SK.fill(ctx, core, { ...base, ang: -1.45 * d, sp: sp * 1.25, brk: 9 });
+    if (vis > 0.3) {
+      // a loose, broken contour along the back and the front
+      const n = coat.length, a0 = (r() * n) | 0;
+      for (let k = 0; k < 3; k++) {
+        const i0 = (a0 + k * 6) % n, seg = []; for (let j = 0; j < 5; j++) seg.push(coat[(i0 + j) % n]);
+        if (r() < vis) SK.pen(ctx, seg, lw * 1.1, { seed: (r() * 1e6) | 0, t0: 0.2, t1: 0.3, alpha: 0.9 });
+      }
+    }
+    // head, mostly hidden
+    const head = []; for (let i = 0; i < 10; i++) { const a = (i / 10) * Math.PI * 2; head.push([X(0.012, -0.9) + Math.cos(a) * 0.05 * h, Y(-0.9) + Math.sin(a) * 0.062 * h]); }
+    SK.fill(ctx, head, { ...base, ang: -1.1 * d, sp: sp * 0.85 });
+    if (F.kind === 'hat') {
+      SK.fill(ctx, [pt([-0.06, -0.94]), pt([0.07, -0.945]), pt([0.055, -1.02]), pt([-0.045, -1.02])], { ...base, ang: 0.25, sp: sp * 0.8 });
+      SK.pen(ctx, [pt([-0.13, -0.93]), pt([0.0, -0.95]), pt([0.15, -0.94])], 0.022 * h, { seed: o.seed, t0: 0.2, t1: 0.2 });
+      SK.fill(ctx, [pt([-0.08, -0.875]), pt([0.06, -0.87]), pt([0.085, -0.79]), pt([-0.11, -0.79])], { ...base, ang: -1.3 * d });   // collar up
+    } else {
+      // umbrella: arm and hand, shaft, a dark dome leaning into the walk
+      SK.fill(ctx, [pt([0.04, -0.79]), pt([0.13, -0.74]), pt([0.14, -0.63]), pt([0.08, -0.62])], { ...base, ang: 1.0 * d });
+      const hand = pt([0.115, -0.64]);
+      const tilt = 0.14 * d + F.sw * 0.02 * d, R = 0.31 * h, Hd = 0.215 * h, c0 = pt([0.06, -0.975]);
+      const rot = (u, v) => [c0[0] + u * Math.cos(tilt) - v * Math.sin(tilt), c0[1] + u * Math.sin(tilt) + v * Math.cos(tilt)];
+      const top = rot(0, -Hd);
+      SK.pen(ctx, [[hand[0], hand[1] + 0.035 * h], hand, rot(0, -Hd * 0.4), top], 0.012 * h + 0.7, { seed: o.seed, t0: 0.05, t1: 0.1, min: 0.6 });
+      SK.pen(ctx, [top, rot(0, -Hd - 0.05 * h)], 0.01 * h + 0.6, { seed: o.seed + 1, t0: 0.05, t1: 0.9 });
+      const dome = [];
+      for (let i = 0; i <= 18; i++) { const a = Math.PI + (i / 18) * Math.PI; const ca = Math.cos(a); dome.push(rot(ca * R, Math.sin(a) * Hd * (1 - 0.35 * ca * ca * ca * ca))); }
+      const ribs = 6;
+      for (let i = ribs; i >= 0; i--) { const u = -R + (2 * R * i) / ribs; dome.push(rot(u, 0.022 * h)); if (i > 0) dome.push(rot(u - R / ribs, -0.008 * h)); }
+      const lit = o.lit ?? 0;
+      const band = lit > 0.08 ? (x, y) => { const v = (y - top[1]) / Hd; return v > 0.05 && v < 0.4 && r() < lit * 0.9; } : null;
+      SK.fill(ctx, dome, { ...base, ang: -0.3 * d, sp: sp * 0.75, brk: 12, skip: band });
+      SK.fill(ctx, dome, { ...base, ang: 0.05 * d, sp: sp * 1.6, keep: keep * 0.6, brk: 7, skip: band });
+      if (vis > 0.35) {
+        const arc = []; for (let i = 0; i <= 8; i++) { const a = Math.PI + (i / 8) * Math.PI, ca = Math.cos(a); arc.push(rot(ca * R * 1.01, Math.sin(a) * Hd * (1 - 0.35 * ca * ca * ca * ca) - 1)); }
+        SK.pen(ctx, arc, lw * 0.9, { seed: o.seed + 3, t0: 0.15, t1: 0.15, alpha: vis });
+      }
+      for (let i = 0; i <= ribs; i++) { const p = rot(-R + (2 * R * i) / ribs, 0.022 * h); if (r() < keep * 0.8) SK.pen(ctx, [p, [p[0] - d * 0.003 * h, p[1] + 0.014 * h]], 0.006 * h + 0.6, { seed: i + 5 }); }
+    }
+    ctx.restore();
+  };
+
+  /** The reflection of a passer-by on the wet street: flat scribbles under the feet, shorter and fainter further down. */
+  SK.reflection = (ctx, F, o = {}) => {
+    const vis = o.vis ?? 1; if (vis <= 0.05) return;
+    const r = SK.rng(o.seed ?? 2), h = F.h, row = 0.045 * h;
+    ctx.save(); ctx.strokeStyle = P.ink; ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+    for (let v = 0.03; v < 0.8; v += 0.028 + r() * 0.03) {
+      if (r() > vis * (1 - v * 0.5)) continue;
+      const w = (v < 0.22 ? 0.09 : v < 0.55 ? 0.15 : 0.2) * h * (0.6 + 0.6 * r()) * (1 - v * 0.2);
+      const x = F.x + F.dir * (r() - 0.5) * 0.06 * h + Math.sin(v * 11 + F.x / 40) * 0.025 * h, y = F.y + 3 + v * h;
+      ctx.globalAlpha = (o.alpha ?? 0.85) * vis * (1 - v * 0.9);
+      SK.zigzag(ctx, x, y, 0.02 * (r() - 0.5), w * 2, row * (0.5 + 0.6 * r()), 2.6 + v * 5, (2.0 - v) * Math.min(1, 0.6 + h / 700), r);
+    }
+    ctx.restore();
+  };
+
+  G.SK = SK;
+})(typeof window !== 'undefined' ? window : globalThis);
+
+/* crossing.js — "Crossing": umbrellas on a zebra crossing, seen straight from above, on a wet street at night in rain.
+ * 8 s seamless loop, 4:5 portrait (1080 x 1350), drawn at 8 drawings per second like a flip book.
+ *
+ * The street is a still: paper, lamplight wash, the scribbled asphalt (strokes along the street), paving on the
+ * sidewalks (crossed strokes), the zebra stripes left as blank paper, two cars waiting with their headlights on,
+ * two street lamps whose pools of light lie on the corners. What moves: the people crossing (re-scribbled on every
+ * drawing), the rain (streaks falling towards us, rings on the wet asphalt) and the wipers of the cars.
+ * Everyone crosses a whole number of times per loop and enters and leaves on blank paper, so the loop has no seam.
+ * Keep right: people walking right use the upper half of the crossing, people walking left the lower half.
+ *
+ * Coordinates: the street is tilted by A. Local u runs across the street (the walking direction), v along it.
+ * Timing is quantised to 1/8 s, so the 24 fps video and the 8 fps GIF show exactly the same drawings.
+ */
+(function (G) {
+  'use strict';
+  const SK = G.SK, P = SK.palette;
+  // the seed: a page may set window.params = { seed } before this script; 7 is the published picture
+  const SEED = (G.params && Number.isFinite(+G.params.seed)) ? Math.round(+G.params.seed) : 7;
+  const W = 1080, H = 1350, DUR = 8, FPS = 8, NF = DUR * FPS, KEY_T = 2.0625;
+  const C = { x: 540, y: 690 }, A = -0.1, CA = Math.cos(A), SA = Math.sin(A);
+  const toXY = (u, v) => [C.x + u * CA - v * SA, C.y + u * SA + v * CA];
+  const toUV = (x, y) => { const dx = x - C.x, dy = y - C.y; return [dx * CA + dy * SA, -dx * SA + dy * CA]; };
+  const ALONG = A + Math.PI / 2, ACROSS = A;            // screen angles of the street axis and of the walking axis
+
+  // ---------- the street ----------
+  const CURB = 350, BAND = 196, STRIPE = 46, PITCH = 92, ZEBRA = 322;    // half widths, stripe width and pitch
+  const STOP = 244;                                                        // stop lines, v = -STOP (upper lane) and +STOP
+  // the two waiting cars: lane centre u, front bumper at v, facing f (+1 faces down the picture, -1 up); the body lies behind the front
+  const CARS = [
+    { u: -185, front: -292, f: 1, len: 470, hw: 98 },
+    { u: 185, front: 292, f: -1, len: 470, hw: 98 },
+  ];
+  // street lamps: post on the sidewalk, head over the street corner, pool of light under the head
+  const LAMPS = [
+    { post: [-392, -330], head: [-298, -322], r: 235 },
+    { post: [392, 332], head: [298, 324], r: 235 },
+  ];
+  const MANHOLE = { u: -170, v: 470, r: 40 };
+
+  /** Where the sketch is drawn at all: 1 in the middle, 0 on the blank paper at the edges (ragged). */
+  function vign(x, y) {
+    const u = Math.abs(x - 540) / 520, v = Math.abs(y - 690) / (y < 690 ? 600 : 620);
+    const rr = Math.pow(Math.pow(u, 3) + Math.pow(v, 3), 1 / 3) + 0.34 * (SK.fbm(x / 150, y / 150, SEED + 21) - 0.5) + 0.08 * (SK.noise(x / 40, y / 40, SEED + 23) - 0.5);
+    return 1 - SK.smooth(0.8, 1.0, rr);
+  }
+
+  /** Car body in car coordinates: a = across (-1..1 of the half width), b = 0 at the front .. 1 at the back. */
+  function carAt(car, u, v) {
+    const a = (u - car.u) / car.hw, b = (car.front - v) * car.f / car.len;
+    if (b < 0 || b > 1) return null;
+    const taper = b < 0.06 ? 0.86 + 0.14 * (b / 0.06) : b > 0.95 ? 1 - 0.12 * ((b - 0.95) / 0.05) : 1;
+    if (Math.abs(a) > taper) return null;
+    return { a, b };
+  }
+  /** Which part of a car (hood, windscreen, roof, rear window, boot) is at b. */
+  const carPart = (b) => (b < 0.27 ? 'hood' : b < 0.42 ? 'glass' : b < 0.76 ? 'roof' : b < 0.86 ? 'rear' : 'boot');
+
+  /** Light 0..1: the pools under the lamps and the headlight beams of the cars. */
+  function light(x, y) {
+    const [u, v] = toUV(x, y);
+    let dark = 1;
+    for (const L of LAMPS) {
+      const r = Math.hypot(u - L.head[0], (v - L.head[1]) * 1.05) / L.r + 0.14 * (SK.noise(u / 45, v / 45, SEED + 5) - 0.5);
+      dark *= 1 - 0.96 * (1 - SK.smooth(0.32, 1.04, r));
+    }
+    for (const car of CARS) {
+      for (const s of [-1, 1]) {
+        const hu = car.u + s * car.hw * 0.66, hv = car.front - car.f * 4;
+        const du = u - hu, dv = (v - hv) * car.f;                         // dv > 0 in front of the car
+        if (dv <= -10) continue;
+        const d = Math.hypot(du, dv), ang = Math.abs(Math.atan2(du - s * dv * 0.08, Math.max(1, dv)));
+        const beam = (1 - SK.smooth(0.22, 0.42, ang)) * (1 - SK.smooth(120, 560, d)) * 0.82 + 0.9 * Math.exp(-((d / 34) ** 2));
+        dark *= 1 - SK.clamp(beam);
+      }
+    }
+    return 1 - dark;
+  }
+
+  /** Material at a point: darkness before light and vignette, and the direction of the scribbles there. */
+  const ANGS = {
+    asphalt: [ACROSS, ACROSS + 0.07, ACROSS - 0.06, ACROSS],  // wet asphalt lies flat: long strokes across the street
+    paving: [ACROSS, ALONG, ACROSS + 0.45, ALONG],             // sidewalk slabs: crossed strokes
+    curb: [ALONG, ALONG, ALONG, ALONG],
+    stripe: [ALONG, ALONG, ALONG, ALONG],
+  };
+  function material(x, y) {
+    const [u, v] = toUV(x, y), au = Math.abs(u);
+    for (const car of CARS) if (carAt(car, u, v)) return { m: 'car', n: 0 };
+    if (au > CURB + 14) return { m: 'paving', n: 0.34 + 0.14 * SK.fbm(u / 90, v / 90, SEED + 7), angs: ANGS.paving, len: 46, wid: 22, jit: 0.3 };
+    if (au > CURB) return { m: 'curb', n: 0.95, angs: ANGS.curb, len: 60, wid: 8, jit: 0.1 };
+    // markings: zebra stripes, stop lines, the dashed centre line, all left as paper (a little worn)
+    const worn = 0.06 + 0.1 * SK.noise(u / 18, v / 30, SEED + 9);
+    if (Math.abs(v) < BAND && au < ZEBRA && (((u + ZEBRA) % PITCH) + PITCH) % PITCH < STRIPE) return { m: 'stripe', n: worn, angs: ANGS.stripe, len: 90, wid: 8, jit: 0.2 };
+    if ((Math.abs(v + STOP) < 15 && u < -6 && u > -CURB + 6) || (Math.abs(v - STOP) < 15 && u > 6 && u < CURB - 6)) return { m: 'stop', n: worn, angs: ANGS.asphalt, len: 60, wid: 10, jit: 0.2 };
+    if (au < 7 && Math.abs(v) > STOP + 30 && ((Math.abs(v) - STOP - 30) % 170) < 85) return { m: 'dash', n: worn, angs: ANGS.asphalt, len: 50, wid: 8, jit: 0.2 };
+    if (Math.hypot(u - MANHOLE.u, v - MANHOLE.v) < MANHOLE.r) return { m: 'manhole', n: 0.97, angs: [ACROSS, ALONG, ACROSS + 0.8, ALONG], len: 26, wid: 20, jit: 0.2 };
+    const n = 0.86 * (0.86 + 0.28 * SK.fbm(u / 60, v / 160, SEED + 11));    // wet asphalt with a little sheen
+    return { m: 'asphalt', n, angs: ANGS.asphalt, len: 104, wid: 11, jit: 0.25 };
+  }
+  /** Darkness of the ground at a point, including the cars (for rain colour). */
+  function groundDark(x, y) {
+    const [u, v] = toUV(x, y);
+    for (const car of CARS) { const c = carAt(car, u, v); if (c) { const p = carPart(c.b); return p === 'roof' ? 0.9 : p === 'glass' || p === 'rear' ? 0.3 : 0.65; } }
+    return material(x, y).n * (1 - light(x, y));
+  }
+
+  // ---------- the people ----------
+  // ua → ub is one crossing; wraps = crossings per loop; lane = v; phase = 0..1 offset along the way.
+  // Rightward walkers keep to the upper half (v < 0), leftward walkers to the lower half.
+  const WALKERS = [
+    { id: 1, kind: 'umbrella', lane: -134, ua: -620, ub: 620, wraps: 1, phase: 0.0, R: 62 },
+    { id: 2, kind: 'umbrella', lane: -12, ua: -620, ub: 620, wraps: 1, phase: 0.025, R: 58 },     // walks with 1: a pair
+    { id: 3, kind: 'hood', lane: -80, ua: -620, ub: 620, wraps: 2, phase: 0.0, R: 30 },           // runs, twice per loop
+    { id: 4, kind: 'umbrella', lane: -12, ua: -620, ub: 620, wraps: 1, phase: 0.5, R: 60 },
+    { id: 5, kind: 'umbrella', lane: 110, ua: 620, ub: -620, wraps: 1, phase: 0.3, R: 61 },
+    { id: 6, kind: 'umbrella', lane: 110, ua: 620, ub: -620, wraps: 1, phase: 0.8, R: 59 },
+    { id: 7, kind: 'umbrella', lane: 196, ua: 520, ub: -520, wraps: 1, phase: 0.55, R: 52 },     // slower, smaller umbrella
+  ].map((w) => {
+    const len = Math.abs(w.ub - w.ua) * w.wraps, stride = w.kind === 'hood' ? 150 : 74;     // px per step
+    return { ...w, dir: Math.sign(w.ub - w.ua), cycles: Math.max(1, Math.round(len / (2 * stride))), rot: SK.hash(w.id, 3, SEED) * Math.PI };
+  });
+
+  const frameOf = (t) => ((Math.floor(t * FPS + 1e-6) % NF) + NF) % NF;
+  /** Where walker w is at time t: position, step phase, visibility. */
+  function walk(w, t) {
+    const p = (((t / DUR) * w.wraps + w.phase) % 1 + 1) % 1, u = w.ua + (w.ub - w.ua) * p;
+    const ph = 2 * Math.PI * ((t / DUR) * w.cycles + w.phase * 3.7);
+    const v = w.lane + 5 * Math.sin(2 * Math.PI * (t / DUR) * w.wraps + w.id);
+    const [x, y] = toXY(u, v);
+    const fade = SK.smooth(0, 0.12, p) * (1 - SK.smooth(0.88, 1, p));
+    return { ...w, u, v, x, y, ph, vis: fade * SK.smooth(0.12, 0.75, vign(x, y)), lit: light(x, y) };
+  }
+
+  /** A shoe: a small dark oval along the walking direction. */
+  function shoe(ctx, u, v, d, r) {
+    const pts = []; for (let i = 0; i < 8; i++) { const a = (i / 8) * Math.PI * 2; pts.push(toXY(u + Math.cos(a) * 12, v + Math.sin(a) * 5.5)); }
+    SK.fill(ctx, pts, { r, ang: ACROSS + 0.3 * d, sp: 2.2, lw: 1.5, over: 1.5 });
+  }
+  /** Fill a polygon with paper first, so the figure sits on the street like a reserved shape. */
+  function knockout(ctx, pts, a) {
+    ctx.save(); ctx.globalAlpha *= a; ctx.fillStyle = P.paper; ctx.beginPath(); pts.forEach((p, i) => (i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1]))); ctx.closePath(); ctx.fill(); ctx.restore();
+  }
+
+  /** A person crossing, seen from above, re-scribbled with seed s. */
+  function person(ctx, F, s) {
+    if (F.vis < 0.03) return;
+    const r = SK.rng(s), d = F.dir, vis = F.vis, R = F.R;
+    ctx.save();
+    ctx.globalAlpha = SK.clamp(vis * 1.6);
+    const keep = SK.clamp(0.2 + vis);
+    // the step: one foot forward while the other is back (running strides are longer)
+    const reach = F.kind === 'hood' ? 44 : 34, sw = Math.sin(F.ph);
+    const feet = [[F.u + d * reach * sw, F.v - 10], [F.u - d * reach * sw, F.v + 10]];
+    for (const [fu, fv] of feet) if (r() < keep) shoe(ctx, fu + d * 6, fv, d, r);
+    // a faint wet smear behind: the blur of walking
+    ctx.save(); ctx.strokeStyle = P.ink; ctx.lineCap = ctx.lineJoin = 'round'; ctx.globalAlpha *= 0.22;
+    const [gx, gy] = toXY(F.u - d * (R * 0.9), F.v);
+    SK.zigzag(ctx, gx, gy, ACROSS, R * 1.3, R * 1.5, 7, 1.3, r);
+    ctx.restore();
+    if (F.kind === 'hood') {
+      // no umbrella: hood and shoulders from above, arms swinging against the legs
+      // shoulders and the jacket, leaning into the run; arms are folded in, swinging a little
+      const sh = [];
+      for (let i = 0; i < 16; i++) { const a = (i / 16) * Math.PI * 2, c = Math.cos(a); sh.push(toXY(F.u + c * (c * d > 0 ? 24 : 30), F.v + Math.sin(a) * 42 + d * 6 * sw * Math.cos(a))); }
+      knockout(ctx, sh, 0.92);
+      SK.fill(ctx, sh, { r, ang: ALONG + 0.35 * d, sp: 2.2, lw: 1.7, over: 2.5, keep });
+      SK.fill(ctx, sh, { r, ang: ACROSS + 0.5, sp: 4, lw: 1.4, over: 1.5, keep: keep * 0.7 });
+      // the hood: a dark round head with a paper rim where the hood opens forward
+      const hu = F.u + d * 8, hd = []; for (let i = 0; i < 12; i++) { const a = (i / 12) * Math.PI * 2; hd.push(toXY(hu + Math.cos(a) * 19, F.v + Math.sin(a) * 17)); }
+      knockout(ctx, hd, 1);
+      SK.fill(ctx, hd, { r, ang: ACROSS - 0.9, sp: 1.9, lw: 1.7, over: 1.2 });
+      const rim = []; for (let i = -3; i <= 3; i++) { const a = (i / 3) * 1.1; rim.push(toXY(hu + d * Math.cos(a) * 19, F.v + Math.sin(a) * 17)); }
+      SK.pen(ctx, rim, 2.4, { col: P.paperLight, seed: s, t0: 0.2, t1: 0.2 });
+      ctx.restore();
+      return;
+    }
+    // umbrella: held a little back, turning slightly with each step; eight facets, ribs left as paper
+    const cu = F.u - d * 9, cv = F.v + 2 * Math.cos(F.ph), rot = F.rot + 0.05 * Math.sin(F.ph);
+    const tips = [], mids = [];
+    for (let k = 0; k < 8; k++) {
+      const a = rot + (k * Math.PI) / 4, rr = R * (1 + 0.03 * (SK.hash(F.id, k, SEED) - 0.5));
+      tips.push([cu + Math.cos(a) * rr, cv + Math.sin(a) * rr]);
+      const am = a + Math.PI / 8; mids.push([cu + Math.cos(am) * rr * 0.9, cv + Math.sin(am) * rr * 0.9]);
+    }
+    const rim = []; for (let k = 0; k < 8; k++) { rim.push(toXY(...tips[k])); rim.push(toXY(...mids[k])); }
+    knockout(ctx, rim, 0.92);
+    // which way the light comes from (nearest lamp or headlight), so the facets facing it are lighter
+    let lu = 0, lv = 0, best = 1e9;
+    for (const L of LAMPS) { const dd = Math.hypot(L.head[0] - cu, L.head[1] - cv); if (dd < best) { best = dd; lu = L.head[0] - cu; lv = L.head[1] - cv; } }
+    const ll = Math.hypot(lu, lv) || 1;
+    for (let k = 0; k < 8; k++) {
+      const t0 = tips[k], t1 = tips[(k + 1) % 8], m = mids[k];
+      const cxu = (cu + t0[0] + t1[0] + m[0]) / 4, cxv = (cv + t0[1] + t1[1] + m[1]) / 4;
+      const shrink = (p, g) => [cxu + (p[0] - cxu) * g, cxv + (p[1] - cxv) * g];
+      const facet = [shrink([cu, cv], 0.86), shrink(t0, 0.93), shrink(m, 0.97), shrink(t1, 0.93)].map((p) => toXY(...p));
+      const bis = rot + (k * Math.PI) / 4 + Math.PI / 8, facing = (Math.cos(bis) * lu + Math.sin(bis) * lv) / ll;
+      const lit = SK.clamp(facing) * SK.clamp(F.lit * 1.6 + 0.25);
+      const ang = A + bis + Math.PI / 2 + (k % 2 ? 0.25 : -0.2);       // strokes run across the facet, alternating
+      SK.fill(ctx, facet, { r, ang, sp: 2.0 * (1 + lit * 1.4), lw: 1.8, over: 2, keep: keep * (1 - lit * 0.3), brk: 9, alpha: 0.95 });
+      if (lit < 0.4) SK.fill(ctx, facet, { r, ang: ang + 0.5, sp: 3.6, lw: 1.5, over: 1.5, keep: keep * 0.8, brk: 7 });
+    }
+    // ferrule in the middle, a few drops drumming on the canopy
+    const [fx, fy] = toXY(cu, cv);
+    ctx.fillStyle = P.paper; ctx.beginPath(); ctx.arc(fx, fy, 5.5, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = P.ink; ctx.beginPath(); ctx.arc(fx, fy, 3.2, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = P.paperLight;
+    for (let i = 0; i < 3; i++) { const a = r() * Math.PI * 2, q = R * (0.3 + 0.55 * r()), [px, py] = toXY(cu + Math.cos(a) * q, cv + Math.sin(a) * q); ctx.beginPath(); ctx.arc(px, py, 1.4, 0, Math.PI * 2); ctx.fill(); }
+    ctx.restore();
+  }
+
+  // ---------- rain ----------
+  const RINGS = 260, STREAKS = 80;
+  /** Rings on the wet ground: each slot lives 4 drawings (64 / 4 = 16 lives per loop, so the loop is seamless). */
+  function drawRain(ctx, f) {
+    ctx.save(); ctx.lineCap = 'round';
+    for (let i = 0; i < RINGS; i++) {
+      const off = Math.floor(SK.hash(i, 1, SEED) * 4), g = ((f + off) % NF + NF) % NF, life = Math.floor(g / 4), age = g % 4;
+      const x = 60 + SK.hash(i, life, SEED + 31) * (W - 120), y = 120 + SK.hash(i, life, SEED + 37) * (H - 220);
+      const V = vign(x, y); if (V < 0.15) continue;
+      const dk = groundDark(x, y), s = 0.7 + 0.6 * SK.hash(i, life, SEED + 41);
+      const rad = [2.2, 5, 7.8, 10][age] * s, a = [0.95, 0.75, 0.5, 0.25][age] * V;
+      if (dk > 0.42) { ctx.strokeStyle = P.paperLight; ctx.globalAlpha = a; } else { ctx.strokeStyle = P.ink; ctx.globalAlpha = a * 0.75; }
+      ctx.lineWidth = age ? 1.0 : 1.4;
+      ctx.beginPath(); ctx.ellipse(x, y, rad, rad * 0.86, A, 0, Math.PI * 2); ctx.stroke();
+    }
+    // drops falling towards us: short streaks pointing away from the middle of the picture
+    for (let i = 0; i < STREAKS; i++) {
+      const x = 40 + SK.hash(i, f, SEED + 51) * (W - 80), y = 60 + SK.hash(i, f, SEED + 53) * (H - 120), V = vign(x, y);
+      if (V < 0.1) continue;
+      const dx = x - C.x, dy = y - C.y, dl = Math.hypot(dx, dy) || 1, len = 7 + dl * 0.045;
+      const dk = groundDark(x, y);
+      if (dk > 0.42) { ctx.strokeStyle = P.paperLight; ctx.globalAlpha = 0.85 * V; } else { ctx.strokeStyle = P.ink; ctx.globalAlpha = 0.6 * V; }
+      ctx.lineWidth = 1.1;
+      ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x + (dx / dl) * len, y + (dy / dl) * len); ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  // ---------- still layers ----------
+  /** A car seen from above: hood, windscreen, a dark roof, rear window, boot; headlights as paper. */
+  function drawCar(b, car, r) {
+    const P2 = (a, bb) => toXY(car.u + a * car.hw, car.front - car.f * bb * car.len);
+    const outline = [];
+    for (let i = 0; i <= 12; i++) { const bb = i / 12; const tp = bb < 0.06 ? 0.86 + 0.14 * (bb / 0.06) : bb > 0.95 ? 0.88 : 1; outline.push(P2(-tp, bb)); }
+    for (let i = 12; i >= 0; i--) { const bb = i / 12; const tp = bb < 0.06 ? 0.86 + 0.14 * (bb / 0.06) : bb > 0.95 ? 0.88 : 1; outline.push(P2(tp, bb)); }
+    const part = (b0, b1, inset = 0.96) => [P2(-inset, b0), P2(inset, b0), P2(inset, b1), P2(-inset, b1)];
+    const along = ALONG + (car.f > 0 ? 0 : Math.PI);
+    SK.fill(b, part(0.02, 0.27, 0.9), { r, ang: ACROSS + 0.3, sp: 3.2, lw: 1.5, over: 2 });                  // hood: mid tone
+    SK.fill(b, part(0.04, 0.25, 0.8), { r, ang: along + 0.6, sp: 6, lw: 1.3, over: 2, keep: 0.7 });
+    SK.fill(b, [P2(-0.82, 0.29), P2(0.82, 0.29), P2(0.9, 0.41), P2(-0.9, 0.41)], { r, ang: ACROSS + 0.9, sp: 11, lw: 1.1, over: 1, keep: 0.8 });  // windscreen: a few glints
+    SK.fill(b, part(0.42, 0.76, 0.86), { r, ang: along - 0.4, sp: 2.4, lw: 1.6, over: 2 });                   // roof: dark
+    SK.fill(b, part(0.42, 0.76, 0.86), { r, ang: along + 0.5, sp: 4.4, lw: 1.4, over: 1.5, keep: 0.8 });
+    SK.fill(b, [P2(-0.86, 0.77), P2(0.86, 0.77), P2(0.82, 0.86), P2(-0.82, 0.86)], { r, ang: ACROSS - 0.8, sp: 12, lw: 1.1, over: 1, keep: 0.7 }); // rear window
+    SK.fill(b, part(0.87, 0.99, 0.86), { r, ang: ACROSS + 0.3, sp: 3.2, lw: 1.5, over: 2 });                  // boot
+    SK.path(b, outline, 1.7, r, { passes: 2, jit: 1.2 });
+    SK.path(b, [P2(-0.82, 0.29), P2(0.82, 0.29)], 1.3, r, { passes: 1, jit: 0.8 });
+    SK.path(b, [P2(-0.9, 0.41), P2(0.9, 0.41)], 1.4, r, { passes: 1, jit: 0.8 });
+    for (const sd of [-1, 1]) {
+      // wing mirrors and headlights
+      const m = P2(sd * 1.12, 0.3), m2 = P2(sd * 1.0, 0.28), mm = P2(sd * 1.0, 0.33);
+      SK.fill(b, [m2, m, P2(sd * 1.14, 0.33), mm], { r, ang: ACROSS, sp: 2, lw: 1.3, over: 1 });
+      const [hx, hy] = P2(sd * 0.66, 0.01);
+      b.save(); b.fillStyle = P.paperLight; b.beginPath(); b.ellipse(hx, hy, 15, 6, A, 0, Math.PI * 2); b.fill(); b.restore();
+      SK.path(b, [[hx - 15, hy - 3], [hx + 15, hy - 6], [hx + 15, hy + 3], [hx - 15, hy + 6], [hx - 15, hy - 3]].map(([x, y]) => [x, y]), 1.1, r, { passes: 1, jit: 0.6 });
+    }
+  }
+
+  /** Paints the still back layer: paper, wash, the scribbled street, markings, cars, lamps. */
+  function paintBack(b) {
+    SK.paper(b, W, H, SEED);
+    // the lamplight is the only colour: a thin wash under the ink
+    for (const L of LAMPS) { const [x, y] = toXY(...L.head); SK.wash(b, x, y, L.r * 0.85, 0.42); }
+    b.save(); b.globalCompositeOperation = 'multiply'; b.filter = 'blur(22px)';
+    for (const car of CARS) for (const s of [-1, 1]) {
+      const hu = car.u + s * car.hw * 0.66, hv = car.front;
+      const g = [toXY(hu - 10, hv), toXY(hu + 10, hv), toXY(hu + s * 40 + 120, hv + car.f * 470), toXY(hu + s * 40 - 120, hv + car.f * 470)];
+      b.fillStyle = 'rgba(233,190,98,0.16)'; b.beginPath(); g.forEach((p, i) => (i ? b.lineTo(p[0], p[1]) : b.moveTo(p[0], p[1]))); b.closePath(); b.fill();
+    }
+    b.restore();
+    // the street, scribbled
+    SK.hatch(b, {
+      w: W, h: H, cell: 24, seed: SEED, alpha: 0.9,
+      field: (x, y) => { const V = vign(x, y); if (V < 0.02) return null; const M = material(x, y); if (!M.angs) return null; return { d: M.n * (1 - light(x, y)) * V, angs: M.angs, len: M.len, wid: M.wid, jit: M.jit }; },
+      layers: [
+        { thr: 0.1, spMax: 13, spMin: 4.2, lw: 1.65 },
+        { thr: 0.36, spMax: 12, spMin: 4.6, lw: 1.5 },
+        { thr: 0.56, spMax: 10, spMin: 4.2, lw: 1.5 },
+        { thr: 0.74, spMax: 8, spMin: 3.6, lw: 1.55 },
+      ],
+    });
+    const r = SK.rng(SEED + 1);
+    // zebra stripes: scraped back to paper after the hatching, a few wet streaks, loose edges
+    for (let k = 0; k * PITCH < 2 * ZEBRA; k++) {
+      const u0 = -ZEBRA + k * PITCH, u1 = u0 + STRIPE, j = () => (r() - 0.5) * 4;
+      const poly = [toXY(u0 + j(), -BAND + j()), toXY(u1 + j(), -BAND + j()), toXY(u1 + j(), BAND + j()), toXY(u0 + j(), BAND + j())];
+      const edge = [];                                                     // a ragged outline: the paint is worn
+      for (let i = 0; i <= 12; i++) edge.push(toXY(u0 + 2 + (r() - 0.5) * 5, -BAND + (2 * BAND * i) / 12));
+      for (let i = 12; i >= 0; i--) edge.push(toXY(u1 - 2 + (r() - 0.5) * 5, -BAND + (2 * BAND * i) / 12));
+      const [mx, my] = toXY((u0 + u1) / 2, 0), V = vign(mx, my);
+      b.save(); b.globalAlpha = 0.94 * SK.clamp(V * 1.4); b.fillStyle = P.paper; b.beginPath(); edge.forEach((q, i) => (i ? b.lineTo(q[0], q[1]) : b.moveTo(q[0], q[1]))); b.closePath(); b.fill(); b.restore();
+      if (V < 0.3) continue;
+      SK.line(b, poly[0], poly[3], 1.3, r, { passes: 1, over: 6, alpha: 0.8 * V });
+      SK.line(b, poly[1], poly[2], 1.3, r, { passes: 1, over: 6, alpha: 0.8 * V });
+      b.save(); b.strokeStyle = P.ink; b.lineCap = 'round'; b.globalAlpha = 0.5 * V; b.lineWidth = 1;
+      for (let q = 0; q < 5; q++) { const uu = u0 + 6 + r() * (STRIPE - 12), vv = -BAND + r() * 2 * BAND, l = 20 + r() * 50; const a = toXY(uu, vv), c = toXY(uu + (r() - 0.5) * 3, vv + l); b.beginPath(); b.moveTo(a[0], a[1]); b.lineTo(c[0], c[1]); b.stroke(); }
+      b.restore();
+    }
+    const lineIn = (a, c, w, o = {}) => {
+      const n = 10; let run = null;
+      for (let i = 0; i <= n; i++) {
+        const q = [a[0] + ((c[0] - a[0]) * i) / n, a[1] + ((c[1] - a[1]) * i) / n], ok = vign(q[0], q[1]) > 0.35;
+        if (ok && !run) run = q;
+        if ((!ok || i === n) && run) { const e = ok ? q : [a[0] + ((c[0] - a[0]) * (i - 1)) / n, a[1] + ((c[1] - a[1]) * (i - 1)) / n]; if (Math.hypot(e[0] - run[0], e[1] - run[1]) > 20) SK.line(b, run, e, w, r, o); run = null; }
+      }
+    };
+    // curbs: a loose double line on each side
+    for (const s of [-1, 1]) { lineIn(toXY(s * CURB, -900), toXY(s * CURB, 900), 1.8, { over: 20 }); lineIn(toXY(s * (CURB + 14), -900), toXY(s * (CURB + 14), 900), 1.2, { over: 20, passes: 1 }); }
+    // paving joints on the sidewalks
+    for (const s of [-1, 1]) for (let v = -900; v < 900; v += 64) lineIn(toXY(s * (CURB + 16), v), toXY(s * 620, v + 3), 1.0, { passes: 1, over: 4, alpha: 0.7 });
+    // a drain at the curb, the manhole
+    for (const [u, v] of [[-CURB + 14, -470], [CURB - 14, 520]]) {
+      for (let k = -2; k <= 2; k++) SK.line(b, toXY(u - 12, v + k * 8), toXY(u + 12, v + k * 8), 1.3, r, { passes: 1, over: 1 });
+    }
+    { const [mx, my] = toXY(MANHOLE.u, MANHOLE.v); const ring = []; for (let i = 0; i <= 14; i++) { const a = (i / 14) * Math.PI * 2; ring.push([mx + Math.cos(a) * MANHOLE.r, my + Math.sin(a) * MANHOLE.r]); } SK.path(b, ring, 1.5, r, { passes: 2, jit: 1 }); }
+    // the cars and lamps on their own layer, faded by the vignette like the rest of the sketch
+    const obj = SK.canvas(W, H), o = obj.getContext('2d');
+    for (const car of CARS) drawCar(o, car, r);
+    // lamps from above: post, arm, the dark housing over its own pool of light
+    for (const L of LAMPS) {
+      const [px, py] = toXY(...L.post), [hx, hy] = toXY(...L.head);
+      o.fillStyle = P.ink; o.beginPath(); o.arc(px, py, 7, 0, Math.PI * 2); o.fill();
+      SK.line(o, [px, py], [hx, hy], 2.2, r, { passes: 2, over: 2 });
+      const ang = Math.atan2(hy - py, hx - px), hs = [];
+      for (let i = 0; i < 12; i++) { const a = (i / 12) * Math.PI * 2; hs.push([hx + Math.cos(a) * 26 * Math.cos(ang) - Math.sin(a) * 11 * Math.sin(ang), hy + Math.cos(a) * 26 * Math.sin(ang) + Math.sin(a) * 11 * Math.cos(ang)]); }
+      SK.fill(o, hs, { r, ang: ang + 1.2, sp: 2.2, lw: 1.5, over: 1.5 });
+    }
+    const mk = SK.canvas(W / 8, H / 8), mc = mk.getContext('2d'), md = mc.createImageData(W / 8, H / 8);
+    for (let y = 0; y < H / 8; y++) for (let x = 0; x < W / 8; x++) { const i = (y * (W / 8) + x) * 4; md.data[i + 3] = 255 * SK.clamp(vign(x * 8 + 4, y * 8 + 4) * 1.6); }
+    mc.putImageData(md, 0, 0);
+    o.save(); o.globalCompositeOperation = 'destination-in'; o.imageSmoothingEnabled = true; o.drawImage(mk, 0, 0, W, H); o.restore();
+    b.drawImage(obj, 0, 0);
+  }
+
+  /** The wipers of the cars: two arms each, lying along the bottom of the windscreen and sweeping up it,
+   *  one sweep every 2 s (four whole periods per loop). From above the glass is foreshortened, so the arc is flat. */
+  function drawWipers(ctx, f) {
+    const tq = f / FPS, sweep = 0.5 - 0.5 * Math.cos(Math.PI * tq);
+    for (const car of CARS) {
+      for (const pa of [0.6, -0.08]) {
+        const th = 0.1 + 1.7 * sweep, Larm = car.hw * 0.78;
+        const pu = car.u + car.f * pa * car.hw, pb = 0.3 * car.len;
+        const eu = pu - car.f * Math.cos(th) * Larm, eb = pb + Math.sin(th) * Larm * 0.55;
+        const pv = car.front - car.f * pb, ev = car.front - car.f * eb;
+        SK.pen(ctx, [toXY(pu, pv), toXY((pu + eu) / 2, (pv + ev) / 2), toXY(eu, ev)], 2.2, { seed: 5, t0: 0.05, t1: 0.2 });
+      }
+    }
+  }
+
+  function build() {
+    const back = SK.canvas(W, H);
+    paintBack(back.getContext('2d'));
+    return { back };
+  }
+
+  /** One frame at time t. */
+  function draw(ctx, t, L) {
+    const f = frameOf(t), tq = f / FPS;
+    ctx.save();
+    ctx.drawImage(L.back, 0, 0, W, H);
+    drawWipers(ctx, f);
+    const Fs = WALKERS.map((w) => walk(w, tq)).sort((a, b) => a.v - b.v);
+    for (const F of Fs) person(ctx, F, F.id * 104729 + f * 31 + (SEED - 7) * 7919);
+    drawRain(ctx, f);
+    ctx.restore();
+  }
+
+  G.Crossing = { W, H, DUR, FPS, KEY_T, build, draw, light, vign, material, walk, WALKERS, toXY, toUV };
+})(typeof window !== 'undefined' ? window : globalThis);
+
+</script>
+<script>
+
+// A seamless loop, 8 drawings per second.
+// Keys: space = pause, s = save PNG.  URL: ?t=2.5 starts (and pauses) at that moment, ?seed=12 draws another one.
+const q = new URLSearchParams(location.search);
+(function () {
+  const S = window['Crossing'], cv = document.getElementById('art'), ctx = cv.getContext('2d');
+  cv.width = S.W; cv.height = S.H;
+  const L = S.build();
+  if (params.t == null || isNaN(params.t)) params.t = S.KEY_T ?? 0;
+  let t0 = performance.now() - params.t * 1000, paused = q.has('t'), tp = params.t;
+  const now = () => (paused ? tp : ((performance.now() - t0) / 1000) % S.DUR);
+  window.renderAt = (t) => S.draw(ctx, t, L);
+  S.draw(ctx, now(), L);
+  window.done = true;
+  const loop = () => { S.draw(ctx, now(), L); requestAnimationFrame(loop); };
+  requestAnimationFrame(loop);
+  addEventListener('keydown', (e) => {
+    if (e.key === ' ') { if (paused) { t0 = performance.now() - tp * 1000; paused = false; } else { tp = now(); paused = true; } e.preventDefault(); }
+    if (e.key === 's') { const a = document.createElement('a'); a.download = `crossing_s${params.seed}_t${now().toFixed(2)}.png`; a.href = cv.toDataURL('image/png'); a.click(); }
+  });
+})();
+
+</script>
+</html>

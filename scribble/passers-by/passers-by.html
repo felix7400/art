@@ -1,0 +1,762 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Passers-by · scribble</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #2a2622; }
+  body { display: grid; place-items: center; }
+  canvas { display: block; max-width: 100vw; max-height: 100vh; }
+</style>
+<canvas id="art" role="img" aria-label="A pen sketch on cream paper: a street lamp on a rainy night. People with umbrellas walk through its pool of light on the wet pavement and dissolve into the scribbled dark."></canvas>
+<script>
+// same seed, same picture. t = where the loop starts (seconds, 0 to 8)
+var params = { seed: 7, t: 2.5625 };
+new URLSearchParams(location.search).forEach((v, k) => { if (k in params) params[k] = +v; });
+</script>
+<script>
+/* scribble.js — drawing library for the style "Scribble Sketch" (Canvas 2D, no dependencies).
+ *
+ * A quick pen sketch in a sketchbook: one warm black ink on cream paper. Tone is never filled, it is
+ * scribbled: small zigzag patches whose spacing gives the value, and whose direction gives the material
+ * (sky diagonal, walls upright, wet street lying flat). Light is the paper that was left blank. Figures
+ * are dense zigzag scribbles with loose, overshooting edges, so they read as people from far and
+ * dissolve when you look closer. Towards the edges of the picture the drawing simply stops.
+ *
+ * All randomness runs through seeded generators (SK.rng, SK.hash, SK.noise); nothing depends on time
+ * or Math.random, so every frame of an animation can be redrawn alone.
+ *
+ * Main API (x right, y down, units px):
+ *   SK.palette                          colour tokens
+ *   SK.rng(seed) · SK.hash(...n) · SK.noise(x, y, seed) · SK.fbm(x, y, seed)
+ *   SK.canvas(w, h)                     offscreen canvas
+ *   SK.paper(ctx, w, h, seed)           cream paper with grain and a few fibres
+ *   SK.pen(ctx, pts, w, o)              one tapered pen stroke through points (Catmull-Rom)
+ *   SK.line(ctx, a, b, w, r, o)         a loose straight line: 1–3 passes, overshoot, slight bow
+ *   SK.zigzag(ctx, x, y, ang, len, wid, sp, lw, r)   one scribble patch (the unit of tone)
+ *   SK.hatch(ctx, o)                    a tonal field of patches from a darkness function
+ *   SK.fill(ctx, poly, o)               scribble-fill a polygon (back and forth, loose edges)
+ *   SK.squiggle(ctx, x0, x1, y, o, r)   a flat wavy stroke (reflections on a wet street)
+ *   SK.wash(ctx, x, y, r, a, o)         the warm lamplight wash (the only colour)
+ *   SK.lampGeo(x, by, gy, s) · SK.lamp(ctx, L, seed)  the street lamp
+ *   SK.walker(o, t) · SK.figure(ctx, F, o)            a passer-by: pose at time t, drawn as a scribble
+ */
+(function (G) {
+  'use strict';
+  const SK = {};
+
+  // ---------- tokens ----------
+  SK.palette = {
+    paper: '#EDE4D0',      // cream sketchbook paper
+    paperLight: '#F4EDDD', // paper in the light, rain lit from behind
+    ink: '#1E1A16',        // warm black ink, the only drawing colour
+    inkSoft: 'rgba(30,26,22,0.55)',
+    wash: '#E9BE62',       // the lamplight: a thin ochre wash, never more than 50 %
+    washDeep: '#D9A24A',
+    grain: '#CFC3A8',      // paper fibres
+  };
+  const P = SK.palette;
+
+  // ---------- randomness ----------
+  SK.rng = (seed) => {
+    let a = seed >>> 0;
+    return () => { a |= 0; a = (a + 0x6D2B79F5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+  };
+  /** Stateless hash of integers → 0..1 */
+  SK.hash = (...n) => {
+    let h = 2166136261 >>> 0;
+    for (const v of n) { h ^= (v | 0) + 0x9e3779b9 + (h << 6) + (h >>> 2); h = Math.imul(h, 16777619) >>> 0; }
+    h ^= h >>> 15; h = Math.imul(h, 0x2c1b3c6d) >>> 0; h ^= h >>> 12; h = Math.imul(h, 0x297a2d39) >>> 0; h ^= h >>> 15;
+    return (h >>> 0) / 4294967296;
+  };
+  const sm = (t) => t * t * (3 - 2 * t);
+  /** Smooth value noise 0..1 */
+  SK.noise = (x, y, seed = 0) => {
+    const xi = Math.floor(x), yi = Math.floor(y), xf = x - xi, yf = y - yi;
+    const a = SK.hash(xi, yi, seed), b = SK.hash(xi + 1, yi, seed), c = SK.hash(xi, yi + 1, seed), d = SK.hash(xi + 1, yi + 1, seed);
+    const u = sm(xf), v = sm(yf);
+    return a + (b - a) * u + (c - a) * v + (a - b - c + d) * u * v;
+  };
+  SK.fbm = (x, y, seed = 0) => 0.55 * SK.noise(x, y, seed) + 0.3 * SK.noise(x * 2.1, y * 2.1, seed + 7) + 0.15 * SK.noise(x * 4.3, y * 4.3, seed + 13);
+  SK.clamp = (x, a = 0, b = 1) => (x < a ? a : x > b ? b : x);
+  SK.smooth = (a, b, x) => { const t = SK.clamp((x - a) / (b - a)); return t * t * (3 - 2 * t); };
+  SK.lerp = (a, b, t) => a + (b - a) * t;
+  SK.canvas = (w, h) => { const c = document.createElement('canvas'); c.width = w; c.height = h; return c; };
+
+  // ---------- paper ----------
+  /** Cream paper: flat colour, fine grain, a few fibres, very slightly darker towards the edges. */
+  SK.paper = (ctx, w, h, seed = 1) => {
+    ctx.save();
+    ctx.fillStyle = P.paper; ctx.fillRect(0, 0, w, h);
+    const r = SK.rng(seed);
+    const img = ctx.getImageData(0, 0, ctx.canvas.width, ctx.canvas.height), d = img.data, cw = ctx.canvas.width, ch = ctx.canvas.height;
+    for (let y = 0; y < ch; y++) for (let x = 0; x < cw; x++) {
+      const i = (y * cw + x) * 4;
+      const n = (r() - 0.5) * 7 + (SK.noise(x / 9, y / 9, seed) - 0.5) * 6;
+      const ex = Math.min(x, cw - 1 - x) / cw, ey = Math.min(y, ch - 1 - y) / ch;
+      const edge = (1 - SK.smooth(0, 0.12, Math.min(ex, ey))) * 7;
+      d[i] += n - edge; d[i + 1] += n - edge * 1.1; d[i + 2] += n - edge * 1.4;
+    }
+    ctx.putImageData(img, 0, 0);
+    ctx.strokeStyle = P.grain; ctx.lineCap = 'round';
+    for (let k = 0; k < (w * h) / 9000; k++) {
+      const x = r() * w, y = r() * h, a = r() * Math.PI, l = 4 + r() * 12;
+      ctx.globalAlpha = 0.25 + r() * 0.3; ctx.lineWidth = 0.5 + r() * 0.4;
+      ctx.beginPath(); ctx.moveTo(x, y); ctx.quadraticCurveTo(x + Math.cos(a) * l * 0.5 + (r() - 0.5) * 3, y + Math.sin(a) * l * 0.5 + (r() - 0.5) * 3, x + Math.cos(a) * l, y + Math.sin(a) * l); ctx.stroke();
+    }
+    ctx.restore();
+  };
+
+  // ---------- pen ----------
+  /** Catmull-Rom resampling of an open polyline (seg points per span). */
+  SK.spline = (pts, seg = 6) => {
+    const n = pts.length; if (n < 3) {
+      if (n < 2) return pts.slice();
+      const o = []; for (let i = 0; i <= seg; i++) { const u = i / seg; o.push([pts[0][0] + (pts[1][0] - pts[0][0]) * u, pts[0][1] + (pts[1][1] - pts[0][1]) * u]); } return o;
+    }
+    const o = [];
+    for (let i = 0; i < n - 1; i++) {
+      const p0 = pts[Math.max(0, i - 1)], p1 = pts[i], p2 = pts[i + 1], p3 = pts[Math.min(n - 1, i + 2)];
+      for (let j = 0; j < seg; j++) {
+        const t = j / seg, t2 = t * t, t3 = t2 * t;
+        o.push([0.5 * (2 * p1[0] + (-p0[0] + p2[0]) * t + (2 * p0[0] - 5 * p1[0] + 4 * p2[0] - p3[0]) * t2 + (-p0[0] + 3 * p1[0] - 3 * p2[0] + p3[0]) * t3),
+                0.5 * (2 * p1[1] + (-p0[1] + p2[1]) * t + (2 * p0[1] - 5 * p1[1] + 4 * p2[1] - p3[1]) * t2 + (-p0[1] + 3 * p1[1] - 3 * p2[1] + p3[1]) * t3)]);
+      }
+    }
+    o.push(pts[n - 1].slice(0, 2));
+    return o;
+  };
+
+  /** One pen stroke: a filled polygon around the spline, tapered at both ends, pressure wobbling along it.
+   *  o: { col, alpha, t0, t1 (taper fractions), min (thinnest, x w), seed, seg } */
+  SK.pen = (ctx, pts, w, o = {}) => {
+    const sp = SK.spline(pts, o.seg ?? 6), n = sp.length; if (n < 2) return;
+    const L = [], R = [], seed = o.seed ?? 3, t0 = o.t0 ?? 0.18, t1 = o.t1 ?? 0.3, mn = o.min ?? 0.3;
+    let len = 0; const cum = [0];
+    for (let i = 1; i < n; i++) { len += Math.hypot(sp[i][0] - sp[i - 1][0], sp[i][1] - sp[i - 1][1]); cum.push(len); }
+    for (let i = 0; i < n; i++) {
+      const a = sp[Math.max(0, i - 1)], b = sp[Math.min(n - 1, i + 1)];
+      let dx = b[0] - a[0], dy = b[1] - a[1]; const dl = Math.hypot(dx, dy) || 1; dx /= dl; dy /= dl;
+      const u = len ? cum[i] / len : 0;
+      const prof = Math.min(1, t0 ? u / t0 : 1, t1 ? (1 - u) / t1 : 1);
+      const pr = 0.8 + 0.4 * SK.noise(cum[i] / 40, 0.5, seed);
+      const hw = (w / 2) * (mn + (1 - mn) * sm(SK.clamp(prof))) * pr;
+      L.push([sp[i][0] - dy * hw, sp[i][1] + dx * hw]); R.push([sp[i][0] + dy * hw, sp[i][1] - dx * hw]);
+    }
+    ctx.save();
+    ctx.fillStyle = o.col || P.ink; ctx.globalAlpha *= o.alpha ?? 1;
+    ctx.beginPath(); ctx.moveTo(L[0][0], L[0][1]);
+    for (let i = 1; i < n; i++) ctx.lineTo(L[i][0], L[i][1]);
+    for (let i = n - 1; i >= 0; i--) ctx.lineTo(R[i][0], R[i][1]);
+    ctx.closePath(); ctx.fill();
+    ctx.restore();
+  };
+
+  /** A loose straight line from a to b: passes (1–3) that miss each other a little, overshoot at the ends, slight bow.
+   *  o: { passes, over, bow, col, alpha, jit } */
+  SK.line = (ctx, a, b, w, r, o = {}) => {
+    const passes = o.passes ?? 2, over = o.over ?? 6, bow = o.bow ?? 0.012, jit = o.jit ?? 1.6;
+    const dx = b[0] - a[0], dy = b[1] - a[1], l = Math.hypot(dx, dy) || 1, ux = dx / l, uy = dy / l, nx = -uy, ny = ux;
+    for (let p = 0; p < passes; p++) {
+      const e0 = (r() - 0.35) * over, e1 = (r() - 0.35) * over, off = (r() - 0.5) * jit * 2, bw = (r() - 0.5) * 2 * bow * l;
+      const A = [a[0] - ux * e0 + nx * off, a[1] - uy * e0 + ny * off], B = [b[0] + ux * e1 + nx * (off + (r() - 0.5) * jit), b[1] + uy * e1 + ny * (off + (r() - 0.5) * jit)];
+      const M = [(A[0] + B[0]) / 2 + nx * bw, (A[1] + B[1]) / 2 + ny * bw];
+      SK.pen(ctx, [A, M, B], w * (p ? 0.75 : 1) * (0.85 + r() * 0.3), { col: o.col, alpha: (o.alpha ?? 1) * (p ? 0.8 : 1), seed: (r() * 1e6) | 0, t0: 0.08, t1: 0.25, min: 0.35 });
+    }
+  };
+
+  /** A loose path through points (several passes). */
+  SK.path = (ctx, pts, w, r, o = {}) => {
+    const passes = o.passes ?? 2, jit = o.jit ?? 1.4;
+    for (let p = 0; p < passes; p++) {
+      const q = pts.map(([x, y]) => [x + (r() - 0.5) * jit * 2, y + (r() - 0.5) * jit * 2]);
+      SK.pen(ctx, q, w * (p ? 0.75 : 1) * (0.85 + r() * 0.3), { col: o.col, alpha: (o.alpha ?? 1) * (p ? 0.8 : 1), seed: (r() * 1e6) | 0, t0: 0.06, t1: 0.15, min: 0.4 });
+    }
+  };
+
+  // ---------- scribble ----------
+  /** Draw a zigzag as one stroked path: each leg slightly bowed, turns rounded by the round join. */
+  function strokeZig(ctx, pts, lw, r, bow = 0.08) {
+    if (pts.length < 2) return;
+    ctx.lineWidth = lw;
+    ctx.beginPath(); ctx.moveTo(pts[0][0], pts[0][1]);
+    for (let i = 1; i < pts.length; i++) {
+      const a = pts[i - 1], b = pts[i], dx = b[0] - a[0], dy = b[1] - a[1];
+      const k = (r() - 0.5) * 2 * bow;
+      ctx.quadraticCurveTo((a[0] + b[0]) / 2 - dy * k, (a[1] + b[1]) / 2 + dx * k, b[0], b[1]);
+    }
+    ctx.stroke();
+  }
+  SK.strokeZig = strokeZig;
+
+  /** One scribble patch: a zigzag of `len` along angle `ang`, `wid` across, legs `sp` apart. The unit of tone. */
+  SK.zigzag = (ctx, cx, cy, ang, len, wid, sp, lw, r, open = 7.5) => {
+    const ux = Math.cos(ang), uy = Math.sin(ang), vx = -uy, vy = ux;
+    const n = Math.max(1, Math.round(wid / sp)), pts = [];
+    if (sp > open) {
+      // loose: separate, nearly parallel strokes instead of a zigzag (no sawtooth where the tone is light)
+      ctx.lineWidth = lw; ctx.beginPath();
+      for (let k = 0; k <= n; k++) {
+        const off = -wid / 2 + (k * wid) / n + (r() - 0.5) * sp * 0.5, l0 = (len / 2) * (0.55 + 0.45 * r()), l1 = (len / 2) * (0.55 + 0.45 * r()), sk = (r() - 0.5) * sp * 0.4;
+        const ax = cx + vx * off - ux * l0, ay = cy + vy * off - uy * l0, bx = cx + vx * (off + sk) + ux * l1, by = cy + vy * (off + sk) + uy * l1, bw = (r() - 0.5) * 0.08 * len;
+        ctx.moveTo(ax, ay); ctx.quadraticCurveTo((ax + bx) / 2 + vx * bw, (ay + by) / 2 + vy * bw, bx, by);
+      }
+      ctx.stroke();
+      return;
+    }
+    for (let k = 0; k <= n; k++) {
+      const off = -wid / 2 + (k * wid) / n + (r() - 0.5) * sp * 0.6;
+      const side = k % 2 ? 1 : -1, l = (len / 2) * (0.62 + 0.38 * r());
+      pts.push([cx + vx * off + ux * side * l, cy + vy * off + uy * side * l]);
+    }
+    strokeZig(ctx, pts, lw, r);
+  };
+
+  /** A tonal field. field(x, y) → { d: darkness 0..1, ang, len, wid } (or null to skip).
+   *  o: { w, h, cell, seed, layers: [{ thr, dAng, spMax, spMin, lw }], col, alpha, x0, y0 } */
+  SK.hatch = (ctx, o) => {
+    const r = SK.rng(o.seed ?? 5), cell = o.cell ?? 24;
+    ctx.save(); ctx.strokeStyle = o.col || P.ink; ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+    for (let li = 0; li < o.layers.length; li++) {
+      const L = o.layers[li];
+      for (let gy = (o.y0 ?? 0) - cell; gy < (o.h ?? 0) + cell; gy += cell) {
+        for (let gx = (o.x0 ?? 0) - cell; gx < (o.w ?? 0) + cell; gx += cell) {
+          const x = gx + r() * cell, y = gy + r() * cell, f = o.field(x, y);
+          const j1 = r(), j2 = r(), j3 = r(), j4 = r(), j5 = r();
+          if (!f) continue;
+          const thr = L.thr + (j1 - 0.5) * (L.spread ?? 0.14);
+          if (f.d <= thr) continue;
+          const k = SK.clamp((f.d - thr) / Math.max(0.05, 1 - L.thr));
+          const sp = SK.lerp(L.spMax, L.spMin, Math.pow(k, 0.8));
+          ctx.globalAlpha = (o.alpha ?? 0.9) * (0.7 + 0.3 * j2) * SK.clamp(0.35 + k * 1.5);
+          const ang = f.angs ? f.angs[li % f.angs.length] : f.ang + (L.dAng ?? 0);
+          SK.zigzag(ctx, x, y, ang + (j3 - 0.5) * (L.angJit ?? 0.22) * (f.jit ?? 1), f.len * (0.6 + 0.8 * j4), f.wid * (0.7 + 0.6 * j5), sp, (L.lw ?? 1.1) * (f.lw ?? 1) * (0.8 + 0.4 * r()), r);
+        }
+      }
+    }
+    ctx.restore();
+  };
+
+  /** Scribble-fill a polygon: lines across at angle `ang`, joined back and forth into a continuous scribble that
+   *  overshoots the outline. o: { ang, sp, lw, over, keep (0..1 chance a leg is drawn), r, brk (legs per pen lift), alpha, col, skip(x,y) } */
+  SK.fill = (ctx, poly, o) => {
+    const r = o.r, a = o.ang, ux = Math.cos(a), uy = Math.sin(a), vx = -uy, vy = ux;
+    const pr = poly.map(([x, y]) => [x * vx + y * vy, x * ux + y * uy]);
+    let sMin = Infinity, sMax = -Infinity;
+    for (const p of pr) { sMin = Math.min(sMin, p[0]); sMax = Math.max(sMax, p[0]); }
+    const sp = o.sp, over = o.over ?? 4, keep = o.keep ?? 1, brk = o.brk ?? 14;
+    ctx.save(); ctx.strokeStyle = o.col || P.ink; ctx.lineJoin = 'round'; ctx.lineCap = 'round'; ctx.globalAlpha *= o.alpha ?? 1;
+    let run = [], k = 0, flip = r() < 0.5;
+    const flush = () => { if (run.length > 1) strokeZig(ctx, run, o.lw * (0.8 + 0.4 * r()), r, o.bow ?? 0.05); run = []; };
+    for (let s = sMin + sp * r() * 0.8; s < sMax; s += sp * (0.75 + 0.5 * r())) {
+      let q0 = Infinity, q1 = -Infinity;
+      for (let i = 0; i < pr.length; i++) {
+        const p = pr[i], q = pr[(i + 1) % pr.length];
+        if ((p[0] - s) * (q[0] - s) <= 0 && p[0] !== q[0]) { const qq = p[1] + ((s - p[0]) / (q[0] - p[0])) * (q[1] - p[1]); q0 = Math.min(q0, qq); q1 = Math.max(q1, qq); }
+      }
+      if (q1 <= q0) { flush(); continue; }
+      const e0 = q0 - (r() - 0.3) * over, e1 = q1 + (r() - 0.3) * over;
+      const A = [s * vx + e0 * ux, s * vy + e0 * uy], B = [s * vx + e1 * ux, s * vy + e1 * uy];
+      if (r() > keep || (o.skip && o.skip((A[0] + B[0]) / 2, (A[1] + B[1]) / 2))) { flush(); continue; }
+      if (flip) run.push(B, A); else run.push(A, B);
+      flip = !flip; k++;
+      if (k % brk === 0 || r() < 0.04) { flush(); }
+    }
+    flush();
+    ctx.restore();
+  };
+
+  /** A flat wavy stroke from x0 to x1 at height y (reflection on a wet street). o: { amp, wl, lw, col, alpha } */
+  SK.squiggle = (ctx, x0, x1, y, o, r) => {
+    const amp = o.amp ?? 2.5, wl = o.wl ?? 26, pts = [], n = Math.max(2, Math.ceil(Math.abs(x1 - x0) / (wl / 2)));
+    for (let i = 0; i <= n; i++) pts.push([x0 + ((x1 - x0) * i) / n + (r() - 0.5) * wl * 0.2, y + (i % 2 ? amp : -amp) * (0.5 + r() * 0.7)]);
+    SK.pen(ctx, pts, o.lw ?? 1.6, { col: o.col, alpha: o.alpha ?? 1, seed: (r() * 1e6) | 0, seg: 4, t0: 0.1, t1: 0.2, min: 0.35 });
+  };
+
+  /** Warm lamplight wash: a soft radial spot of ochre, multiplied onto the paper. o: { sx, sy (squash), col } */
+  SK.wash = (ctx, x, y, rad, a, o = {}) => {
+    ctx.save();
+    ctx.globalCompositeOperation = 'multiply';
+    ctx.translate(x, y); ctx.scale(o.sx ?? 1, o.sy ?? 1);
+    const g = ctx.createRadialGradient(0, 0, 0, 0, 0, rad), c = o.rgb || [233, 190, 98];
+    g.addColorStop(0, `rgba(${c},${a})`); g.addColorStop(0.45, `rgba(${c},${a * 0.55})`); g.addColorStop(1, `rgba(${c},0)`);
+    ctx.fillStyle = g; ctx.beginPath(); ctx.arc(0, 0, rad, 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
+  };
+
+  // ---------- the street lamp ----------
+  /** Geometry of an old lantern lamp: base at (x, by), centre of the glass at gy, scale s (1 ≈ 800 px tall). */
+  SK.lampGeo = (x, by, gy, s = 1) => ({
+    x, by, gy, s,
+    glassTop: gy - 40 * s, glassBot: gy + 36 * s, wTop: 33 * s, wBot: 20 * s,   // half widths of the glass
+    roofBrim: gy - 46 * s, roofTop: gy - 104 * s, brim: 46 * s,
+    cup: gy + 54 * s, collar: gy + 70 * s, arm: gy + 96 * s, armW: 44 * s,
+    shaftTop: gy + 74 * s, shaftW0: 5 * s, shaftW1: 9 * s,
+    ring: by - 120 * s, plinth: by - 70 * s, plinthW: 22 * s, footW: 30 * s,
+  });
+
+  /** The lamp as a sketch: iron parts scribbled dark, glass left as paper, lines that search a little. */
+  SK.lamp = (ctx, L, seed = 1, o = {}) => {
+    const r = SK.rng(seed), s = L.s, x = L.x, lw = 1.7 * s, ink = P.ink;
+    ctx.save();
+    // shaft: two loose lines and a dark vertical scribble between them
+    const shaft = [[x - L.shaftW0, L.shaftTop], [x + L.shaftW0, L.shaftTop], [x + L.shaftW1, L.plinth], [x - L.shaftW1, L.plinth]];
+    SK.fill(ctx, shaft, { ang: Math.PI / 2 + 0.05, sp: 2.1 * s, lw: 1.3 * s, over: 2.5 * s, r, brk: 9, alpha: 0.95 });
+    SK.line(ctx, [x - L.shaftW0, L.shaftTop], [x - L.shaftW1, L.plinth], lw, r, { over: 8 * s });
+    SK.line(ctx, [x + L.shaftW0, L.shaftTop], [x + L.shaftW1, L.plinth], lw * 0.8, r, { over: 8 * s, passes: 1 });
+    // rings on the shaft
+    for (const [yy, ww] of [[L.ring, 14 * s], [L.ring + 12 * s, 12 * s], [L.collar + 6 * s, 10 * s]]) {
+      SK.fill(ctx, [[x - ww, yy - 4 * s], [x + ww, yy - 4 * s], [x + ww * 0.9, yy + 4 * s], [x - ww * 0.9, yy + 4 * s]], { ang: 0.1, sp: 2 * s, lw: 1.2 * s, over: 2 * s, r, alpha: 0.95 });
+    }
+    // plinth and foot
+    const pl = [[x - L.plinthW * 0.55, L.plinth - 6 * s], [x + L.plinthW * 0.55, L.plinth - 6 * s], [x + L.plinthW, L.by - 16 * s], [x + L.footW, L.by - 8 * s], [x + L.footW, L.by], [x - L.footW, L.by], [x - L.footW, L.by - 8 * s], [x - L.plinthW, L.by - 16 * s]];
+    SK.fill(ctx, pl, { ang: Math.PI / 2 - 0.15, sp: 2.2 * s, lw: 1.3 * s, over: 3 * s, r, brk: 8, alpha: 0.95 });
+    SK.path(ctx, [pl[1], pl[2], pl[3], pl[4]], lw, r, { passes: 1 });
+    SK.line(ctx, [x - L.footW - 10 * s, L.by + 1], [x + L.footW + 14 * s, L.by + 2], lw, r, { passes: 2, over: 10 * s });
+    // ladder arm (the cross bar under the lantern) with ball ends
+    SK.line(ctx, [x - L.armW, L.arm], [x + L.armW, L.arm], lw * 1.3, r, { passes: 2, over: 3 * s });
+    for (const sd of [-1, 1]) {
+      ctx.fillStyle = ink; ctx.beginPath(); ctx.arc(x + sd * (L.armW + 3 * s), L.arm, 4.2 * s, 0, Math.PI * 2); ctx.fill();
+      SK.pen(ctx, [[x + sd * L.armW * 0.55, L.arm], [x + sd * L.armW * 0.25, L.arm - 14 * s], [x + sd * 6 * s, L.arm - 22 * s]], 1.4 * s, { seed: seed + sd });
+    }
+    // cup under the glass
+    const cup = [[x - L.wBot - 3 * s, L.glassBot], [x + L.wBot + 3 * s, L.glassBot], [x + 9 * s, L.cup], [x + 5 * s, L.collar], [x - 5 * s, L.collar], [x - 9 * s, L.cup]];
+    SK.fill(ctx, cup, { ang: 0.15, sp: 2 * s, lw: 1.3 * s, over: 2 * s, r, alpha: 0.95 });
+    // glass: outline, mullions; the inside stays paper
+    const gl = [[x - L.wTop, L.glassTop], [x + L.wTop, L.glassTop], [x + L.wBot, L.glassBot], [x - L.wBot, L.glassBot]];
+    SK.line(ctx, gl[0], gl[3], lw, r, { over: 4 * s });
+    SK.line(ctx, gl[1], gl[2], lw, r, { over: 4 * s });
+    SK.line(ctx, gl[3], gl[2], lw, r, { over: 3 * s, passes: 1 });
+    for (const f of [-0.42, 0.38]) SK.line(ctx, [x + L.wTop * f, L.glassTop + 2 * s], [x + L.wBot * f, L.glassBot - 2 * s], 1.1 * s, r, { passes: 1, over: 2 * s, alpha: 0.85 });
+    // the flame: a small scribble in the middle of the glass
+    if (o.flame !== false) {
+      SK.pen(ctx, [[x - 1 * s, L.gy + 22 * s], [x - 5 * s, L.gy + 12 * s], [x - 3 * s, L.gy + 3 * s], [x + 1 * s, L.gy], [x + 4 * s, L.gy + 6 * s], [x + 4 * s, L.gy + 15 * s], [x + 1 * s, L.gy + 22 * s]], 1.1 * s, { seed: seed + 4, alpha: 0.75, t0: 0.1, t1: 0.1 });
+      SK.line(ctx, [x - 7 * s, L.gy + 26 * s], [x + 7 * s, L.gy + 26 * s], 1.6 * s, r, { passes: 1, over: 1 });
+    }
+    // roof: a dark hat, its underside lit
+    const roof = [[x - L.brim, L.roofBrim + 2 * s], [x - L.brim * 0.62, L.roofBrim - 12 * s], [x - 7 * s, L.roofTop + 6 * s], [x + 7 * s, L.roofTop + 6 * s], [x + L.brim * 0.62, L.roofBrim - 12 * s], [x + L.brim, L.roofBrim + 2 * s]];
+    SK.fill(ctx, roof, { ang: -1.15, sp: 2.2 * s, lw: 1.3 * s, over: 3 * s, r, brk: 10, alpha: 0.95 });
+    SK.path(ctx, roof, lw, r, { passes: 2 });
+    SK.line(ctx, [x - L.brim - 4 * s, L.roofBrim + 3 * s], [x + L.brim + 4 * s, L.roofBrim + 3 * s], lw * 1.2, r, { passes: 2 });
+    SK.line(ctx, [x - L.wTop - 4 * s, L.glassTop], [x + L.wTop + 4 * s, L.glassTop], lw, r, { passes: 1 });
+    // finial
+    ctx.fillStyle = ink; ctx.beginPath(); ctx.arc(x, L.roofTop - 2 * s, 5.5 * s, 0, Math.PI * 2); ctx.fill();
+    SK.pen(ctx, [[x, L.roofTop - 6 * s], [x + 0.5, L.roofTop - 18 * s], [x, L.roofTop - 30 * s]], 2.4 * s, { seed: seed + 9, t0: 0.05, t1: 0.9 });
+    ctx.restore();
+  };
+
+  // ---------- passers-by ----------
+  /** Pose of a walker at time t.  o: { x, y (feet on the ground), h (figure height px), dir (+1 right, −1 left),
+   *  cycles (walk cycles per loop), dur, phase, kind: 'umbrella' | 'hat' }. Returns key points in px. */
+  SK.walker = (o, t) => {
+    const ph = 2 * Math.PI * ((t / o.dur) * o.cycles + (o.phase ?? 0));
+    const h = o.h, d = o.dir;
+    const bob = -Math.abs(Math.cos(ph)) * 0.014 * h + 0.007 * h;
+    const step = (o.step ?? 0.17) * h;                      // half the stride
+    const sw = Math.sin(ph), lift = (u) => Math.max(0, u) * 0.05 * h;
+    // foot A swings forward while sin rises; B is opposite
+    const fA = [o.x + d * step * Math.sin(ph), o.y - lift(Math.cos(ph))];
+    const fB = [o.x - d * step * Math.sin(ph), o.y - lift(-Math.cos(ph))];
+    return { ...o, ph, bob, sw, fA, fB };
+  };
+
+  // outlines of the coats in units of the figure height, forward = +u, up = −v (feet at 0, top of the head at −1)
+  const COAT = {
+    umbrella: [[-0.05, -0.865], [-0.112, -0.818], [-0.134, -0.74], [-0.14, -0.6], [-0.148, -0.45], [-0.162, -0.33], [-0.185, -0.255], [-0.11, -0.238], [0.0, -0.246], [0.1, -0.242], [0.158, -0.268], [0.142, -0.4], [0.132, -0.52], [0.152, -0.6], [0.158, -0.665], [0.125, -0.75], [0.095, -0.812], [0.04, -0.865]],
+    hat: [[-0.045, -0.88], [-0.1, -0.86], [-0.125, -0.8], [-0.135, -0.66], [-0.142, -0.5], [-0.158, -0.34], [-0.19, -0.23], [-0.1, -0.215], [0.0, -0.222], [0.1, -0.218], [0.165, -0.24], [0.148, -0.38], [0.14, -0.52], [0.135, -0.66], [0.12, -0.8], [0.085, -0.86], [0.04, -0.885]],
+  };
+
+  /** Draw a passer-by as a scribble.  F from SK.walker.  o: { seed, vis (0..1 how much of it is drawn: fewer, looser
+   *  strokes as it falls), lit (0..1 light on the umbrella), sp (scribble spacing px), lw } */
+  SK.figure = (ctx, F, o = {}) => {
+    const vis = o.vis ?? 1; if (vis <= 0.03) return;
+    const r = SK.rng(o.seed ?? 1), h = F.h, d = F.dir, lean = 0.035;
+    const X = (u, v) => F.x + d * (u + lean * Math.max(0, -v - 0.3)) * h, Y = (v) => F.y + v * h + F.bob;
+    const pt = ([u, v]) => [X(u, v), Y(v)];
+    const sp = (o.sp ?? 2.8) / Math.pow(Math.max(0.3, vis), 0.8), lw = (o.lw ?? 1.9) * Math.min(1, 0.6 + h / 700), over = (o.over ?? 0.014) * h;
+    const keep = SK.clamp(0.15 + vis);
+    const base = { r, sp, lw, over, keep, alpha: o.alpha ?? 0.95 };
+    ctx.save();
+    ctx.globalAlpha *= SK.clamp(vis * 1.7);      // a passer-by fades as well as thins out
+    // a faint trailing copy of the coat: the blur of walking
+    if (o.ghost) {
+      const back = COAT[F.kind === 'hat' ? 'hat' : 'umbrella'];
+      for (const [k, a] of [[0.05, o.ghost], [0.1, o.ghost * 0.5]]) {
+        const g = back.map(([u, v]) => [X(u - k, v), Y(v)]);
+        SK.fill(ctx, g, { ...base, ang: -1.1 * d, sp: sp * 2.4, keep: keep * 0.7, alpha: a, brk: 6, over: over * 2 });
+      }
+    }
+    ctx.globalAlpha *= base.alpha;
+    // legs: two tapered strokes under the coat, knees slightly bent, a short stroke for the shoe
+    for (const f of [F.fB, F.fA]) {
+      const hip = [X(0, -0.36) + (f[0] - F.x) * 0.25, Y(-0.36)];
+      const knee = [(hip[0] + f[0]) / 2 + d * 0.014 * h, (hip[1] + f[1]) / 2];
+      if (r() < keep) SK.pen(ctx, [hip, knee, [f[0], f[1] - 0.015 * h]], 0.036 * h + 1, { seed: (r() * 1e6) | 0, t0: 0.02, t1: 0.3, min: 0.5 });
+      if (r() < keep * 0.7) SK.pen(ctx, [[hip[0] + d * 0.012 * h, hip[1]], [knee[0] + d * 0.01 * h, knee[1]]], 0.016 * h + 0.8, { seed: (r() * 1e6) | 0, t0: 0.1, t1: 0.4 });
+      SK.pen(ctx, [[f[0] - d * 0.025 * h, f[1] - 0.01 * h], [f[0] + d * 0.02 * h, f[1] - 0.004 * h], [f[0] + d * 0.05 * h, f[1] + 0.002 * h]], 0.026 * h + 0.8, { seed: (r() * 1e6) | 0, t0: 0.1, t1: 0.5 });
+    }
+    ctx.globalAlpha /= base.alpha;
+    // coat: the back of the hem swings with the stride
+    const coat = COAT[F.kind === 'hat' ? 'hat' : 'umbrella'].map(([u, v], i) => {
+      const swing = v > -0.3 ? F.sw * 0.018 * (u < 0 ? 1 : 0.5) : 0;
+      return pt([u + swing, v]);
+    });
+    const cx = coat.reduce((a, p) => a + p[0], 0) / coat.length, cy = coat.reduce((a, p) => a + p[1], 0) / coat.length;
+    const core = coat.map(([x, y]) => [cx + (x - cx) * 0.62, cy + (y - cy) * 0.8]);
+    SK.fill(ctx, coat, { ...base, ang: -1.22 * d, brk: 12 });
+    SK.fill(ctx, coat, { ...base, ang: -0.82 * d, sp: sp * 1.7, keep: keep * 0.6, brk: 7 });
+    SK.fill(ctx, core, { ...base, ang: -1.45 * d, sp: sp * 1.25, brk: 9 });
+    if (vis > 0.3) {
+      // a loose, broken contour along the back and the front
+      const n = coat.length, a0 = (r() * n) | 0;
+      for (let k = 0; k < 3; k++) {
+        const i0 = (a0 + k * 6) % n, seg = []; for (let j = 0; j < 5; j++) seg.push(coat[(i0 + j) % n]);
+        if (r() < vis) SK.pen(ctx, seg, lw * 1.1, { seed: (r() * 1e6) | 0, t0: 0.2, t1: 0.3, alpha: 0.9 });
+      }
+    }
+    // head, mostly hidden
+    const head = []; for (let i = 0; i < 10; i++) { const a = (i / 10) * Math.PI * 2; head.push([X(0.012, -0.9) + Math.cos(a) * 0.05 * h, Y(-0.9) + Math.sin(a) * 0.062 * h]); }
+    SK.fill(ctx, head, { ...base, ang: -1.1 * d, sp: sp * 0.85 });
+    if (F.kind === 'hat') {
+      SK.fill(ctx, [pt([-0.06, -0.94]), pt([0.07, -0.945]), pt([0.055, -1.02]), pt([-0.045, -1.02])], { ...base, ang: 0.25, sp: sp * 0.8 });
+      SK.pen(ctx, [pt([-0.13, -0.93]), pt([0.0, -0.95]), pt([0.15, -0.94])], 0.022 * h, { seed: o.seed, t0: 0.2, t1: 0.2 });
+      SK.fill(ctx, [pt([-0.08, -0.875]), pt([0.06, -0.87]), pt([0.085, -0.79]), pt([-0.11, -0.79])], { ...base, ang: -1.3 * d });   // collar up
+    } else {
+      // umbrella: arm and hand, shaft, a dark dome leaning into the walk
+      SK.fill(ctx, [pt([0.04, -0.79]), pt([0.13, -0.74]), pt([0.14, -0.63]), pt([0.08, -0.62])], { ...base, ang: 1.0 * d });
+      const hand = pt([0.115, -0.64]);
+      const tilt = 0.14 * d + F.sw * 0.02 * d, R = 0.31 * h, Hd = 0.215 * h, c0 = pt([0.06, -0.975]);
+      const rot = (u, v) => [c0[0] + u * Math.cos(tilt) - v * Math.sin(tilt), c0[1] + u * Math.sin(tilt) + v * Math.cos(tilt)];
+      const top = rot(0, -Hd);
+      SK.pen(ctx, [[hand[0], hand[1] + 0.035 * h], hand, rot(0, -Hd * 0.4), top], 0.012 * h + 0.7, { seed: o.seed, t0: 0.05, t1: 0.1, min: 0.6 });
+      SK.pen(ctx, [top, rot(0, -Hd - 0.05 * h)], 0.01 * h + 0.6, { seed: o.seed + 1, t0: 0.05, t1: 0.9 });
+      const dome = [];
+      for (let i = 0; i <= 18; i++) { const a = Math.PI + (i / 18) * Math.PI; const ca = Math.cos(a); dome.push(rot(ca * R, Math.sin(a) * Hd * (1 - 0.35 * ca * ca * ca * ca))); }
+      const ribs = 6;
+      for (let i = ribs; i >= 0; i--) { const u = -R + (2 * R * i) / ribs; dome.push(rot(u, 0.022 * h)); if (i > 0) dome.push(rot(u - R / ribs, -0.008 * h)); }
+      const lit = o.lit ?? 0;
+      const band = lit > 0.08 ? (x, y) => { const v = (y - top[1]) / Hd; return v > 0.05 && v < 0.4 && r() < lit * 0.9; } : null;
+      SK.fill(ctx, dome, { ...base, ang: -0.3 * d, sp: sp * 0.75, brk: 12, skip: band });
+      SK.fill(ctx, dome, { ...base, ang: 0.05 * d, sp: sp * 1.6, keep: keep * 0.6, brk: 7, skip: band });
+      if (vis > 0.35) {
+        const arc = []; for (let i = 0; i <= 8; i++) { const a = Math.PI + (i / 8) * Math.PI, ca = Math.cos(a); arc.push(rot(ca * R * 1.01, Math.sin(a) * Hd * (1 - 0.35 * ca * ca * ca * ca) - 1)); }
+        SK.pen(ctx, arc, lw * 0.9, { seed: o.seed + 3, t0: 0.15, t1: 0.15, alpha: vis });
+      }
+      for (let i = 0; i <= ribs; i++) { const p = rot(-R + (2 * R * i) / ribs, 0.022 * h); if (r() < keep * 0.8) SK.pen(ctx, [p, [p[0] - d * 0.003 * h, p[1] + 0.014 * h]], 0.006 * h + 0.6, { seed: i + 5 }); }
+    }
+    ctx.restore();
+  };
+
+  /** The reflection of a passer-by on the wet street: flat scribbles under the feet, shorter and fainter further down. */
+  SK.reflection = (ctx, F, o = {}) => {
+    const vis = o.vis ?? 1; if (vis <= 0.05) return;
+    const r = SK.rng(o.seed ?? 2), h = F.h, row = 0.045 * h;
+    ctx.save(); ctx.strokeStyle = P.ink; ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+    for (let v = 0.03; v < 0.8; v += 0.028 + r() * 0.03) {
+      if (r() > vis * (1 - v * 0.5)) continue;
+      const w = (v < 0.22 ? 0.09 : v < 0.55 ? 0.15 : 0.2) * h * (0.6 + 0.6 * r()) * (1 - v * 0.2);
+      const x = F.x + F.dir * (r() - 0.5) * 0.06 * h + Math.sin(v * 11 + F.x / 40) * 0.025 * h, y = F.y + 3 + v * h;
+      ctx.globalAlpha = (o.alpha ?? 0.85) * vis * (1 - v * 0.9);
+      SK.zigzag(ctx, x, y, 0.02 * (r() - 0.5), w * 2, row * (0.5 + 0.6 * r()), 2.6 + v * 5, (2.0 - v) * Math.min(1, 0.6 + h / 700), r);
+    }
+    ctx.restore();
+  };
+
+  G.SK = SK;
+})(typeof window !== 'undefined' ? window : globalThis);
+
+/* passers-by.js — "Passers-by": a street lamp on a rainy night, people with umbrellas walk through its light.
+ * 8 s seamless loop, 4:5 portrait for social posts (1080 x 1350), drawn at 8 drawings per second like a flip book.
+ *
+ * The night is a still: paper, lamplight wash and the scribbled darkness are painted once (back layer).
+ * What moves: four passers-by (re-scribbled every drawing, so they boil like a flip book), their reflections,
+ * the rain and its splashes, and the lamp, whose lines boil slowly (a new drawing every half second).
+ * People appear out of the blank paper at the edge of the sketch, walk through the light and dissolve again,
+ * so the loop has no seam.
+ *
+ * Timing is quantised to 1/8 s, so the 24 fps video and the 8 fps GIF show exactly the same drawings.
+ */
+(function (G) {
+  'use strict';
+  const SK = G.SK, P = SK.palette;
+  // the seed: a page may set window.params = { seed } before this script; 7 is the published picture
+  const SEED = (G.params && Number.isFinite(+G.params.seed)) ? Math.round(+G.params.seed) : 7;
+  const W = 1080, H = 1350, DUR = 8, FPS = 8, NF = DUR * FPS, SALT = (SEED - 7) * 7919;
+  const HZ = 780;                                       // eye level: the heads of the passers-by sit on it
+  const LAMP = SK.lampGeo(372, 1150, 392, 1);           // the lamp: base on the pavement, glass at 392
+  const LX = LAMP.x, LY = LAMP.gy;                      // the light source
+  const POOL = { x: 384, y: 1150, rx: 400, ry: 104 };    // pool of light on the wet pavement
+  const TAN = POOL.rx / (POOL.y - LY);                  // the cone reaches the edge of the pool
+  const FAR = { x: 905, y: 655, by: 806 };              // a second lamp far down the street
+
+  // ---------- the night as a darkness field ----------
+  /** Where the sketch is drawn at all: 1 in the middle, 0 on the blank paper at the edges (ragged). */
+  function vign(x, y) {
+    const u = Math.abs(x - 530) / (x < 530 ? 540 : 500), v = Math.abs(y - 760) / (y < 760 ? 560 : 640);
+    const rr = Math.pow(Math.pow(u, 3) + Math.pow(v, 3), 1 / 3) + 0.34 * (SK.fbm(x / 150, y / 150, SEED) - 0.5) + 0.08 * (SK.noise(x / 40, y / 40, SEED + 3) - 0.5);
+    return 1 - SK.smooth(0.8, 1.0, rr);
+  }
+  /** Light 0..1 from the lamp (halo, cone in the rain, pool, streak on the wet street) and the far lamp. */
+  function light(x, y) {
+    const dx = x - LX, dy = y - LY, r = Math.hypot(dx, dy);
+    const halo = 0.99 * Math.exp(-((r / 118) ** 2)) + 0.45 * Math.exp(-((r / 250) ** 2));
+    let cone = 0;
+    if (dy > 20) { const c = Math.abs(dx) / (dy * TAN + 30); cone = (1 - SK.smooth(0.74, 1.0, c + 0.1 * (SK.noise(x / 30, y / 90, SEED) - 0.5))) * (0.93 - 0.25 * Math.min(1, dy / 760)); }
+    let pool = 0, refl = 0;
+    if (y > HZ) {
+      const e = Math.hypot((x - POOL.x) / POOL.rx, (y - POOL.y) / POOL.ry);
+      pool = 0.98 * (1 - SK.smooth(0.5, 1.08, e + 0.12 * (SK.noise(x / 40, y / 14, SEED) - 0.5)));
+      if (y > POOL.y - 30) refl = 0.85 * Math.exp(-(((x - LX) / (24 + (y - POOL.y) * 0.06)) ** 2)) * (1 - 0.45 * SK.smooth(POOL.y, H, y));
+    }
+    const r2 = Math.hypot(x - FAR.x, y - FAR.y);
+    const far = 0.9 * Math.exp(-((r2 / 34) ** 2)) + 0.3 * Math.exp(-((r2 / 85) ** 2));
+    let farPool = 0;
+    if (y > HZ - 4) {
+      farPool = 0.75 * (1 - SK.smooth(0.3, 1.1, Math.hypot((x - FAR.x) / 85, (y - FAR.by - 4) / 15)));
+      if (y > FAR.by) farPool = Math.max(farPool, 0.6 * Math.exp(-(((x - FAR.x) / 9) ** 2)) * (1 - SK.smooth(FAR.by, FAR.by + 160, y)));
+    }
+    return 1 - (1 - halo) * (1 - cone) * (1 - pool) * (1 - refl) * (1 - far) * (1 - farPool);
+  }
+  // buildings: [x0, x1, top] and their windows [x, y, w, h, lit]
+  const BLOCKS = [[735, 905, 458], [905, 1120, 414], [-40, 208, 522]];
+  const WINDOWS = [
+    [776, 520, 36, 52, 0], [850, 520, 36, 52, 1], [776, 612, 36, 52, 0], [850, 612, 36, 52, 0],
+    [952, 486, 40, 56, 0], [1030, 486, 40, 56, 0], [952, 590, 40, 56, 1], [1030, 590, 40, 56, 0],
+    [40, 572, 40, 56, 1], [120, 572, 40, 56, 0], [40, 668, 40, 50, 0], [120, 668, 40, 50, 0],
+  ];
+  const ROOFS = (x) => 692 + 16 * Math.sin(x / 47) + 10 * Math.sin(x / 13 + 1) + (x > 420 && x < 520 ? -28 : 0);
+  function material(x, y) {
+    if (y >= HZ) return 'street';
+    for (const [x0, y0, w, h, lit] of WINDOWS) if (x > x0 && x < x0 + w && y > y0 && y < y0 + h) return lit ? 'lit' : 'window';
+    for (const [x0, x1, top] of BLOCKS) if (x > x0 && x < x1 && y > top) return 'wall';
+    if (x > 960 && x < 990 && y > 372) return 'wall';   // chimney
+    if (x > 208 && x < 735 && y > ROOFS(x)) return 'far';
+    return 'sky';
+  }
+  /** Darkness 0..1 of the night before the vignette, plus the direction the scribbles take there. */
+  const RAIN = Math.atan2(1, -0.2), UP = -Math.PI / 2 + 0.05;
+  const ANGS = {
+    sky: [RAIN, RAIN + 0.5, RAIN - 0.3, RAIN + 0.15],   // the night is hatched along the rain
+    wall: [UP, 0.04, UP + 0.45, UP],                     // walls stand upright
+    far: [UP + 0.08, 0.06, UP - 0.3, UP],
+    street: [0.02, -0.05, 0.06, 0.0],                    // the wet street lies flat
+  };
+  function night(x, y) {
+    const m = material(x, y);
+    switch (m) {
+      case 'street': {
+        let n = (0.64 + 0.12 * SK.smooth(HZ, H, y)) * (0.78 + 0.44 * SK.fbm(x / 210, y / 50, SEED + 5));
+        for (const [x0, , w, , lit] of WINDOWS) if (lit && y < HZ + 150) n *= 1 - 0.75 * Math.exp(-(((x - x0 - w / 2) / (w * 0.4)) ** 2)) * (1 - (y - HZ) / 150);
+        return { m, n, angs: ANGS.street, len: 120, wid: 9, jit: 0.25 };
+      }
+      case 'wall': return { m, n: 0.9, angs: ANGS.wall, len: 46, wid: 24, jit: 0.4 };
+      case 'window': return { m, n: 1, angs: ANGS.wall, len: 30, wid: 20, jit: 0.4 };
+      case 'lit': return { m, n: 0.04, angs: ANGS.wall, len: 20, wid: 10 };
+      case 'far': return { m, n: 0.86, angs: ANGS.far, len: 36, wid: 22, jit: 0.5 };
+      default: return { m, n: 0.8 + 0.1 * (1 - y / HZ), angs: ANGS.sky, len: 96, wid: 26, jit: 0.35 };
+    }
+  }
+  const dark = (x, y) => night(x, y).n * (1 - light(x, y));
+
+  // ---------- the passers-by ----------
+  // xa → xb is one walk per loop; both ends lie on blank paper, so the jump back is never seen.
+  // tc: the moment each one passes the lamp, staggered by about 2 s so the light is rarely empty
+  const WALKERS = [
+    { id: 4, kind: 'umbrella', h: 168, y: 944, dir: -1, xa: 1010, xb: 300, tc: 3.2 },
+    { id: 3, kind: 'hat', h: 206, y: 986, dir: 1, xa: 90, xb: 930, tc: 4.8 },
+    { id: 2, kind: 'umbrella', h: 300, y: 1098, dir: -1, xa: 1200, xb: 10, tc: 5.6 },
+    { id: 1, kind: 'umbrella', h: 420, y: 1236, dir: 1, xa: -300, xb: 1350, tc: 1.4 },
+  ].map((w) => ({ ...w, off: ((((LX - w.xa) / (w.xb - w.xa) - w.tc / DUR) % 1) + 1) % 1, cycles: 5, step: Math.abs(w.xb - w.xa) / 5 / 4 / w.h }));
+
+  const frameOf = (t) => ((Math.floor(t * FPS + 1e-6) % NF) + NF) % NF;
+  /** Position, pose and visibility of walker w at time t. */
+  function walk(w, t) {
+    const u = (((t / DUR) + w.off) % 1 + 1) % 1, x = w.xa + (w.xb - w.xa) * u;
+    const F = SK.walker({ ...w, x, dur: DUR, phase: w.off * w.cycles }, t);
+    const fade = SK.smooth(0, 0.1, u) * (1 - SK.smooth(0.9, 1, u));
+    F.vis = fade * SK.clamp(vign(x, w.y - w.h * 0.5) * 1.25);
+    F.lit = light(x, w.y - w.h * 1.15);
+    return F;
+  }
+
+  // ---------- rain ----------
+  const DROPS = Array.from({ length: 260 }, (_, i) => {
+    const z = SK.hash(i, 3, SEED);
+    return { x0: SK.hash(i, 1, SEED), ph: SK.hash(i, 2, SEED), z, k: 9 + Math.floor(SK.hash(i, 4, SEED) * 3), len: 60 + 70 * SK.hash(i, 5, SEED),
+      yg: HZ + 12 + Math.pow(z, 0.9) * (H - HZ + 40) };
+  });
+  const SLANT = -0.2, SPAN = H + 260;
+
+  function drawRain(ctx, f) {
+    const tq = f / FPS;
+    ctx.save(); ctx.lineCap = 'round';
+    for (let i = 0; i < DROPS.length; i++) {
+      const d = DROPS[i], u = (d.ph + (tq / DUR) * d.k) % 1;
+      const yh = -160 + u * SPAN, yt = yh - d.len;        // head and tail of the streak
+      const xAt = (y) => ((d.x0 * (W + 300) - 150 + SLANT * y) % (W + 300) + (W + 300)) % (W + 300) - 150;
+      if (yt < d.yg) {
+        const ye = Math.min(yh, d.yg), x1 = xAt(ye), x0 = x1 - SLANT * (ye - yt);
+        const mx = (x0 + x1) / 2, my = (yt + ye) / 2, V = vign(mx, my);
+        if (V > 0.03) {
+          const L = light(mx, my), n = night(mx, my).n * (1 - L);
+          const vis = V * (0.35 + 0.65 * L) * (0.5 + 0.5 * d.z);
+          if (n > 0.38) { ctx.strokeStyle = P.paperLight; ctx.globalAlpha = Math.min(1, vis * 1.5); }
+          else { ctx.strokeStyle = P.ink; ctx.globalAlpha = Math.min(1, vis * 1.1); }
+          ctx.lineWidth = 0.75 + 0.55 * d.z;
+          ctx.beginPath(); ctx.moveTo(x0, yt); ctx.lineTo(x1, ye); ctx.stroke();
+        }
+      }
+      // splash: the two drawings after the drop reaches its ground
+      const back = (yh - d.yg) / (SPAN * d.k / DUR / FPS);
+      if (back >= 0 && back < 2) {
+        const sx = xAt(d.yg), sy = d.yg, L = light(sx, sy), V = vign(sx, sy);
+        if (L > 0.22 && V > 0.2) {
+          const s = 0.5 + d.z * 0.9, o = back < 1 ? 1 : 1.7;
+          ctx.strokeStyle = P.ink; ctx.globalAlpha = V * Math.min(1, L * 1.3) * (back < 1 ? 0.8 : 0.45); ctx.lineWidth = 0.9 * s;
+          ctx.beginPath(); ctx.ellipse(sx, sy, 5 * s * o, 1.5 * s * o, 0, 0, Math.PI * 2); ctx.stroke();
+        }
+      }
+    }
+    ctx.restore();
+  }
+
+  // ---------- still layers ----------
+  function farLamp(ctx, r) {
+    const x = FAR.x, gy = FAR.y;
+    SK.line(ctx, [x, gy + 14], [x, FAR.by], 2.2, r, { over: 3, passes: 2 });
+    SK.line(ctx, [x - 9, gy + 22], [x + 9, gy + 22], 1.4, r, { passes: 1, over: 1 });
+    SK.path(ctx, [[x - 7, gy - 9], [x - 5, gy + 10], [x + 5, gy + 10], [x + 7, gy - 9]], 1.3, r, { passes: 1, jit: 0.5 });
+    SK.fill(ctx, [[x - 11, gy - 9], [x, gy - 21], [x + 11, gy - 9]], { ang: -1, sp: 1.6, lw: 1, over: 1, r });
+    SK.line(ctx, [x - 14, FAR.by + 1], [x + 14, FAR.by + 1], 1.3, r, { passes: 1, over: 3 });
+  }
+
+  /** Paints the still back layer: paper, the warm wash, the scribbled night, walls and windows, the wet street. */
+  function paintBack(b) {
+    SK.paper(b, W, H, SEED);
+    // the lamplight is the only colour: a thin wash under the ink
+    SK.wash(b, LX, LY + 4, 170, 0.5);
+    b.save(); b.globalCompositeOperation = 'multiply'; b.filter = 'blur(26px)';
+    const g = b.createLinearGradient(0, LY, 0, POOL.y);
+    g.addColorStop(0, 'rgba(233,190,98,0.26)'); g.addColorStop(1, 'rgba(233,190,98,0.12)');
+    b.fillStyle = g; b.beginPath(); b.moveTo(LX - 26, LY + 40); b.lineTo(LX + 26, LY + 40); b.lineTo(POOL.x + POOL.rx * 0.85, POOL.y); b.lineTo(POOL.x - POOL.rx * 0.85, POOL.y); b.closePath(); b.fill();
+    b.restore();
+    SK.wash(b, POOL.x, POOL.y, POOL.rx * 1.05, 0.4, { sy: 0.32 });
+    SK.wash(b, LX, POOL.y + 120, 150, 0.3, { sx: 0.22 });
+    SK.wash(b, FAR.x, FAR.y, 60, 0.45);
+    SK.wash(b, FAR.x, FAR.by + 6, 80, 0.3, { sy: 0.22 });
+    for (const [x, y, w, h, lit] of WINDOWS) if (lit) SK.wash(b, x + w / 2, y + h / 2, w * 0.95, 0.42, { sy: h / w });
+
+    // the darkness, scribbled
+    SK.hatch(b, {
+      w: W, h: H, cell: 26, seed: SEED, alpha: 0.9,
+      field: (x, y) => { const V = vign(x, y); if (V < 0.02) return null; const N = night(x, y); return { d: N.n * (1 - light(x, y)) * V, angs: N.angs, len: N.len, wid: N.wid, jit: N.jit }; },
+      layers: [
+        { thr: 0.1, spMax: 13, spMin: 4.2, lw: 1.7 },
+        { thr: 0.36, spMax: 12, spMin: 4.6, lw: 1.55 },
+        { thr: 0.56, spMax: 10, spMin: 4.2, lw: 1.5 },
+        { thr: 0.74, spMax: 8, spMin: 3.6, lw: 1.6 },
+      ],
+    });
+
+    const r = SK.rng(SEED + 1), inside = (x, y) => vign(x, y) > 0.35;
+    // lit windows: scraped back to paper after the hatching, then a little wash
+    for (const [x, y, w, h, lit] of WINDOWS) {
+      if (!lit || !inside(x + w / 2, y + h / 2)) continue;
+      b.save(); b.fillStyle = P.paperLight; b.globalAlpha = 0.82; b.beginPath();
+      b.moveTo(x + r() * 2, y + r() * 2); b.lineTo(x + w - r() * 2, y + r() * 2); b.lineTo(x + w - r() * 2, y + h - r() * 2); b.lineTo(x + r() * 2, y + h - r() * 2); b.closePath(); b.fill(); b.restore();
+      SK.wash(b, x + w / 2, y + h / 2, w * 0.8, 0.5, { sy: h / w });
+    }
+    // walls: loose edges, only where the sketch is drawn
+    const lineIn = (a, c, w, o) => {
+      const n = 8; let run = null;
+      for (let i = 0; i <= n; i++) {
+        const q = [a[0] + ((c[0] - a[0]) * i) / n, a[1] + ((c[1] - a[1]) * i) / n], ok = vign(q[0], q[1]) > 0.4;
+        if (ok && !run) run = q;
+        if ((!ok || i === n) && run) { const e = ok ? q : [a[0] + ((c[0] - a[0]) * (i - 1)) / n, a[1] + ((c[1] - a[1]) * (i - 1)) / n]; if (Math.hypot(e[0] - run[0], e[1] - run[1]) > 20) SK.line(b, run, e, w, r, o); run = null; }
+      }
+    };
+    lineIn([735, 460], [736, 786], 1.6, { over: 10 });
+    lineIn([728, 458], [906, 457], 1.5, { over: 10 });
+    lineIn([904, 414], [905, 470], 1.4, { passes: 1 });
+    lineIn([208, 524], [209, 788], 1.6, { over: 10 });
+    lineIn([60, 523], [214, 521], 1.5, { over: 10 });
+    // windows: the lit ones get a cross, every one a sill
+    for (const [x, y, w, h, lit] of WINDOWS) {
+      if (!inside(x + w / 2, y + h / 2)) continue;
+      if (lit) {
+        SK.line(b, [x + w / 2, y + 2], [x + w / 2, y + h - 2], 1.2, r, { passes: 1, over: 1 });
+        SK.line(b, [x + 2, y + h * 0.42], [x + w - 2, y + h * 0.42], 1.2, r, { passes: 1, over: 1 });
+        SK.line(b, [x - 2, y], [x + w + 2, y], 1.4, r, { passes: 1, over: 2 });
+      }
+      SK.line(b, [x - 5, y + h + 3], [x + w + 5, y + h + 3], 1.7, r, { passes: 1, over: 2 });   // sill
+    }
+    // where the houses meet the street
+    lineIn([150, 788], [1000, 790], 1.3, { over: 30, passes: 2, alpha: 0.85 });
+    farLamp(b, r);
+    // the wet street: flat ripples across the streak of the lamp, a few long reflections
+    b.save(); b.strokeStyle = P.ink; b.lineJoin = 'round'; b.lineCap = 'round';
+    for (let y = POOL.y + 22; y < H - 20; y += 12 + r() * 14) {
+      const half = 16 + (y - POOL.y) * 0.1 + r() * 22, x = LX + (r() - 0.5) * 22;
+      if (vign(x, y) < 0.2) continue;
+      b.globalAlpha = 0.85 * vign(x, y);
+      SK.zigzag(b, x, y, 0.03 * (r() - 0.5), half * 2, 4 + r() * 6, 3.4, 1.4, r);
+    }
+    for (let y = FAR.by + 10; y < FAR.by + 120; y += 9 + r() * 8) { b.globalAlpha = 0.7; SK.zigzag(b, FAR.x, y, 0, 18 + r() * 10, 3, 3, 1.1, r); }
+    b.restore();
+  }
+
+  /** Build the still layers: back, and the lamp in four slightly different drawings (it boils, 2 drawings/s). */
+  function build() {
+    const back = SK.canvas(W, H);
+    paintBack(back.getContext('2d'));
+    const lamps = [0, 1, 2, 3].map((k) => { const c = SK.canvas(W, H); SK.lamp(c.getContext('2d'), LAMP, SEED * 10 + k); return c; });
+    return { back, lamps };
+  }
+
+  /** One frame at time t. */
+  function draw(ctx, t, L) {
+    const f = frameOf(t), tq = f / FPS;
+    ctx.save();
+    ctx.drawImage(L.back, 0, 0, W, H);
+    const Fs = WALKERS.map((w) => [w, walk(w, tq)]);
+    // reflections first (they lie on the street), then the people behind the lamp, the lamp, the people in front
+    for (const [w, F] of Fs) SK.reflection(ctx, F, { seed: w.id * 7919 + f + SALT, vis: F.vis, alpha: 0.9 });
+    const person = (w, F) => {
+      const s = w.id * 104729 + f * 31 + SALT;
+      SK.figure(ctx, F, { seed: s, vis: F.vis, lit: F.lit, sp: 2.4 + 120 / w.h, ghost: 0.18 });
+    };
+    for (const [w, F] of Fs) if (w.y < LAMP.by) person(w, F);
+    ctx.drawImage(L.lamps[Math.floor(f / 4) % 4], 0, 0, W, H);
+    for (const [w, F] of Fs) if (w.y >= LAMP.by) person(w, F);
+    drawRain(ctx, f);
+    ctx.restore();
+  }
+
+  G.PassersBy = { W, H, DUR, FPS, build, draw, light, vign, night, dark, LAMP, WALKERS, walk, frameOf };
+})(typeof window !== 'undefined' ? window : globalThis);
+
+</script>
+<script>
+
+// Passers-by: an 8 s seamless loop, 8 drawings per second.
+// Keys: space = pause, s = save PNG.  URL: ?t=2.5 starts (and pauses) at that moment, ?seed=12 draws another night.
+const q = new URLSearchParams(location.search);
+(function () {
+  const S = PassersBy, cv = document.getElementById('art'), ctx = cv.getContext('2d');
+  cv.width = S.W; cv.height = S.H;
+  const L = S.build();
+  let t0 = performance.now() - params.t * 1000, paused = q.has('t'), tp = params.t;
+  const now = () => (paused ? tp : ((performance.now() - t0) / 1000) % S.DUR);
+  window.renderAt = (t) => S.draw(ctx, t, L);
+  S.draw(ctx, now(), L);
+  window.done = true;
+  const loop = () => { S.draw(ctx, now(), L); requestAnimationFrame(loop); };
+  requestAnimationFrame(loop);
+  addEventListener('keydown', (e) => {
+    if (e.key === ' ') { if (paused) { t0 = performance.now() - tp * 1000; paused = false; } else { tp = now(); paused = true; } e.preventDefault(); }
+    if (e.key === 's') { const a = document.createElement('a'); a.download = `passers-by_s${params.seed}_t${now().toFixed(2)}.png`; a.href = cv.toDataURL('image/png'); a.click(); }
+  });
+})();
+
+</script>
+</html>
